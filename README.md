@@ -2,32 +2,36 @@
 
 > **Oblivion** est une solution de transfert contrôlé et automatisé de fichiers entre deux domaines Active Directory totalement isolés, via une passerelle Linux sécurisée.
 
-![Oblivion Logo](docs/oblivion-logo.png)
-
 ---
 
 ## 🚀 Présentation
 
-Dans certains environnements sensibles (banques, administrations, infrastructures critiques), il existe plusieurs domaines **Active Directory** totalement isolés les uns des autres.  
+Dans certains environnements sensibles (banques, administrations, infrastructures critiques), il existe plusieurs domaines **Active Directory** totalement isolés les uns des autres. 
+
 La question devient alors : *comment permettre à un utilisateur autorisé de transférer un fichier de manière sécurisée entre ces mondes cloisonnés ?*
 
 **Oblivion** répond à ce besoin.  
+
 Il s’agit d’un **relais Linux** assurant des transferts automatiques de fichiers entre deux domaines distincts, sans jamais ouvrir de communication directe entre eux.  
+
 Les échanges reposent sur une logique de **répertoires IN/OUT** synchronisés par un service robuste.
 
 ---
 
 ## 📐 Architecture
 
-- **DOM1** : `192.168.10.0/24`  
+- **DOM1** : `192.168.10.0/24`
+  
   - Contrôleur de domaine : `192.168.10.2`
   - Comptes suffixés en `.dmz`
 
-- **DOM2** : `10.10.240.0/24`  
+- **DOM2** : `10.10.240.0/24`
+  
   - Contrôleur de domaine : `10.10.240.2`
   - Comptes suffixés en `.adm`
 
-- **Passerelle Oblivion (Linux)** :  
+- **Passerelle Oblivion (Linux)** :
+  
   - Interface DOM1 : `192.168.10.1`
   - Interface DOM2 : `10.10.240.1`
   - Service de synchronisation `systemd` toutes les **10 secondes**
@@ -35,30 +39,31 @@ Les échanges reposent sur une logique de **répertoires IN/OUT** synchronisés 
 Chaque utilisateur autorisé dispose de deux répertoires transactionnels :  
 
 ```
-
 Transactions/
 └── user.suffix/
 ├── IN   # Fichiers à envoyer vers l’autre domaine
 └── OUT  # Fichiers reçus depuis l’autre domaine
-
 ````
 
 ---
 
 ## 🔧 Fonctionnement
 
-1. **Création des comptes** :  
+1. **Création des comptes** :
+   
    - Utilisateurs créés automatiquement via script PowerShell (`dc1.ps1` / `dc2.ps1`).  
    - Ajoutés au groupe de sécurité `DMZ_2_ADM`.  
    - Répertoires `IN` et `OUT` créés avec ACLs spécifiques.
 
-2. **Relais Linux** :  
+3. **Relais Linux** :
+   
    - Monte les partages `Transactions` de DOM1 et DOM2 en **CIFS**.  
    - Exécute `/usr/local/sbin/ftbridge_sync.sh` en service `systemd`.  
    - Synchronisation **bidirectionnelle** toutes les 10 secondes.  
    - Logs détaillés dans `/var/log/ftbridge/sync.log`.
 
-3. **Transfert** :  
+5. **Transfert** :
+   
    - Fichiers stables déposés dans `IN` → transférés automatiquement vers `OUT` de l’autre domaine.  
    - Contrôles d’intégrité basés sur la taille des fichiers.  
 
