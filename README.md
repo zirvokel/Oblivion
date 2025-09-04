@@ -1,20 +1,20 @@
 # Oblivion
 
-> **Oblivion** is a controlled and automated file transfer solution between two completely isolated Active Directory domains, through a secured Linux gateway.
+> **Oblivion** est une solution contrôlée et automatisée de transfert de fichiers entre deux domaines Active Directory complètement isolés, via une passerelle Linux sécurisée.
 
 ---
 
-## 🚀 Overview
+## 🚀 Vue d’ensemble
 
-In sensitive environments (banks, administrations, critical infrastructures), multiple **Active Directory** domains may exist in complete isolation from one another.
+Dans des environnements sensibles (banques, administrations, infrastructures critiques), plusieurs domaines **Active Directory** peuvent exister en isolation complète les uns des autres.
 
-The question becomes: *how can an authorized user securely transfer a file between these walled-off worlds?*
+La question devient : *comment un utilisateur autorisé peut-il transférer un fichier en toute sécurité entre ces mondes cloisonnés ?*
 
-**Oblivion** answers that question.
+**Oblivion** répond à cette question.
 
-It acts as a **Linux relay**, automating file transfers between two distinct domains without ever opening direct communication between them.
+Il agit comme un **relais Linux**, automatisant les transferts de fichiers entre deux domaines distincts sans jamais ouvrir de communication directe entre eux.
 
-Transfers rely on a simple yet secure **IN/OUT folder model**, synchronized by a robust background service.
+Les transferts reposent sur un modèle simple mais sécurisé de **répertoires IN/OUT**, synchronisés par un service en arrière-plan robuste.
 
 ---
 
@@ -22,76 +22,76 @@ Transfers rely on a simple yet secure **IN/OUT folder model**, synchronized by a
 
 * **DOM1** : `192.168.10.0/24`
 
-  * Domain Controller: `192.168.10.2`
-  * Accounts suffixed with `.dmz`
+  * Contrôleur de domaine : `192.168.10.2`
+  * Comptes suffixés par `.dmz`
 
 * **DOM2** : `10.10.240.0/24`
 
-  * Domain Controller: `10.10.240.2`
-  * Accounts suffixed with `.adm`
+  * Contrôleur de domaine : `10.10.240.2`
+  * Comptes suffixés par `.adm`
 
-* **Oblivion Gateway (Linux)** :
+* **Passerelle Oblivion (Linux)** :
 
-  * DOM1 Interface: `192.168.10.1`
-  * DOM2 Interface: `10.10.240.1`
-  * Synchronization service via `systemd` every **10 seconds**
+  * Interface DOM1 : `192.168.10.1`
+  * Interface DOM2 : `10.10.240.1`
+  * Service de synchronisation via `systemd` toutes les **10 secondes**
 
-Each authorized user is given two transactional directories:
+Chaque utilisateur autorisé reçoit deux répertoires transactionnels :
 
 ```
 Transactions/
-└── user.suffix/
-    ├── IN   # Files to send to the other domain
-    └── OUT  # Files received from the other domain
+└── utilisateur.suffixe/
+    ├── IN   # Fichiers à envoyer vers l’autre domaine
+    └── OUT  # Fichiers reçus depuis l’autre domaine
 ```
 
 ---
 
-## 🔧 How It Works
+## 🔧 Fonctionnement
 
-1. **User Creation**
+1. **Création des utilisateurs**
 
-   * Accounts automatically provisioned via PowerShell (`dc1.ps1` / `dc2.ps1`)
-   * Added to the security group `DMZ_2_ADM`
-   * `IN` and `OUT` directories created with strict ACLs
+   * Comptes provisionnés automatiquement via PowerShell (`dc1.ps1` / `dc2.ps1`)
+   * Ajoutés au groupe de sécurité `DMZ_2_ADM`
+   * Répertoires `IN` et `OUT` créés avec des ACL strictes
 
-2. **Linux Relay**
+2. **Relais Linux**
 
-   * Mounts each domain’s `Transactions` share via **CIFS**
-   * Runs `/usr/local/sbin/ftbridge_sync.sh` as a `systemd` service
-   * Performs **bidirectional synchronization** every 10 seconds
-   * Detailed logs available in `/var/log/ftbridge/sync.log`
+   * Monte le partage `Transactions` de chaque domaine via **CIFS**
+   * Exécute `/usr/local/sbin/ftbridge_sync.sh` en tant que service `systemd`
+   * Effectue une **synchronisation bidirectionnelle** toutes les 10 secondes
+   * Journaux détaillés disponibles dans `/var/log/ftbridge/sync.log`
 
-3. **File Transfer**
+3. **Transfert de fichiers**
 
-   * Stable files placed in `IN` → automatically copied to `OUT` in the other domain
-   * File stability validated via size consistency check
+   * Les fichiers stables placés dans `IN` → copiés automatiquement dans `OUT` de l’autre domaine
+   * La stabilité est validée par un contrôle de cohérence de la taille
 
 ---
 
 ## ⚙️ Installation
 
-### 1. On each Domain Controller (DC1 & DC2)
+### 1. Sur chaque contrôleur de domaine (DC1 & DC2)
 
-Run the appropriate PowerShell script:
+Exécuter le script PowerShell approprié :
 
 ```powershell
-.\dc1.ps1   # On DOM1
-.\dc2.ps1   # On DOM2
+.\dc1.ps1   # Sur DOM1
+.\dc2.ps1   # Sur DOM2
 ```
 
-These scripts:
+Ces scripts :
 
-* Create the `DMZ_2_ADM` group
-* Configure the `Transactions` share
-* Apply ACLs
-* Provision service accounts (`svc_relay_dom1`, `svc_relay_dom2`)
+* Créent le groupe `DMZ_2_ADM`
+* Configurent le partage `Transactions`
+* Appliquent les ACL
+* Provisionnent les comptes de service (`svc_relay_dom1`, `svc_relay_dom2`)
 
 ---
 
-### 2. On the Linux Gateway
+### 2. Sur la passerelle Linux
 
-Download and run the installer:
+Télécharger et exécuter l’installateur :
 
 ```bash
 curl -o /opt/setup_relay.sh https://github.com/<ORG>/oblivion/setup_relay.sh
@@ -99,19 +99,19 @@ chmod +x /opt/setup_relay.sh
 sudo /opt/setup_relay.sh
 ```
 
-The script will:
+Le script :
 
-* Configure network interfaces
-* Install dependencies (`rsync`, `cifs-utils`, `smbclient`)
-* Mount `Transactions` shares
-* Deploy `ftbridge_sync.sh`
-* Set up a **systemd service + timer (10s)**
+* Configure les interfaces réseau
+* Installe les dépendances (`rsync`, `cifs-utils`, `smbclient`)
+* Monte les partages `Transactions`
+* Déploie `ftbridge_sync.sh`
+* Met en place un **service + timer systemd (10s)**
 
 ---
 
-## 📊 Logging
+## 📊 Journalisation
 
-All transfers are logged, e.g.:
+Tous les transferts sont enregistrés, par exemple :
 
 ```
 [2025-09-04 11:02:13] === CYCLE ===
@@ -119,7 +119,7 @@ All transfers are logged, e.g.:
 [2025-09-04 11:02:13] DOM2->DOM1 : f.golgo.adm/IN -> f.golgo.dmz/OUT
 ```
 
-Logs are stored in:
+Les journaux sont stockés dans :
 
 ```
 /var/log/ftbridge/sync.log
@@ -127,49 +127,49 @@ Logs are stored in:
 
 ---
 
-## 🔒 Security
+## 🔒 Sécurité
 
-* **No routing** between DOM1 and DOM2 (`net.ipv4.ip_forward=0`)
-* **Strict isolation** via per-user directories
-* **Windows ACLs** ensure only the user and relay service can access files
-* **Controlled relay** → never direct network access between domains
-
----
-
-## 🛠️ Roadmap
-
-* [x] Fixed and reliable bidirectional sync
-* [x] User management and permission fixes
-* [ ] Integration of **ClamAV** for antivirus scanning
-* [ ] Linux hardening (**firewall, minimal services**)
-* [ ] Enhanced logging verbosity and traceability
-* [ ] File **queue system** to handle copy operations
-* [ ] Automatic **ClamAV report** dropped in the user’s `OUT` folder
-* [ ] Configurable **unidirectional/bidirectional** sync modes
-* [ ] Production-ready deployment documentation
-* [ ] (Future) Web-based **GUI dashboard** for easier administration
+* **Pas de routage** entre DOM1 et DOM2 (`net.ipv4.ip_forward=0`)
+* **Isolation stricte** par répertoires utilisateurs
+* **ACL Windows** garantissant que seuls l’utilisateur et le service de relais accèdent aux fichiers
+* **Relais contrôlé** → jamais d’accès réseau direct entre domaines
 
 ---
 
-## 📝 License
+## 🛠️ Feuille de route
 
-Distributed under the **Apache 2.0 License**.
-See the [LICENSE](LICENSE) file for details.
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome!
-
-Please:
-
-1. Fork the repo
-2. Create a branch (`feature/my-feature`)
-3. Submit a detailed PR
+* [x] Synchronisation bidirectionnelle fiable et robuste
+* [x] Gestion des utilisateurs et corrections des permissions
+* [ ] Intégration de **ClamAV** pour l’antivirus
+* [ ] Renforcement Linux (**pare-feu, services minimaux**)
+* [ ] Journalisation plus détaillée et traçabilité
+* [ ] Système de **file d’attente** pour gérer les copies
+* [ ] Rapport automatique **ClamAV** déposé dans le `OUT` de l’utilisateur
+* [ ] Modes de synchro configurables (**unidirectionnel/bidirectionnel**)
+* [ ] Documentation de déploiement prête pour la production
+* [ ] (Futur) Tableau de bord **GUI web** pour une administration simplifiée
 
 ---
 
-## 👨‍💻 Authors
+## 📝 Licence
+
+Distribué sous **Apache 2.0 License**.
+Voir le fichier [LICENSE](LICENSE) pour plus de détails.
+
+---
+
+## 🤝 Contribution
+
+Les contributions sont les bienvenues !
+
+Veuillez :
+
+1. Forker le dépôt
+2. Créer une branche (`feature/ma-fonctionnalité`)
+3. Soumettre une PR détaillée
+
+---
+
+## 👨‍💻 Auteurs
 
 * **Fede**
