@@ -163,11 +163,4 @@ Merci de :
 
 ## 👨‍💻 Auteurs
 
-* **Équipe projet Oblivion**
-  *Développement, sécurité et intégration*
-
----
-
-👉 Je peux aussi te générer un **logo minimaliste** (SVG/PNG sombre type pro) pour mettre dans `docs/oblivion-logo.png`, si tu veux.  
-
-Tu veux que je te propose un **logo stylé type cyber/sécurité** pour Oblivion ?
+* **Fede**
