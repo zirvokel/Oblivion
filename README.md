@@ -136,14 +136,18 @@ Les logs sont stockés dans :
 
 ---
 
-## 📦 Roadmap
+## 🛠️ Améliorations prévues
 
-* [x] Synchronisation bidirectionnelle fiable
-* [x] ACLs utilisateurs et services
-* [x] Service `systemd` toutes les 10s
-* [ ] Intégration de métriques Prometheus
-* [ ] Dashboard d’administration (Web UI)
-* [ ] Support multi-domaines (>2)
+* [x] Synchronisation bidirectionnelle corrigée et fiable
+* [x] Gestion des utilisateurs et correction des erreurs de permissions
+* [ ] Intégration de **ClamAV** pour l’analyse antivirale des fichiers transférés
+* [ ] Renforcement de la sécurité Linux (**hardening**, pare-feu, services minimaux)
+* [ ] Amélioration de la verbosité et de la traçabilité des logs Linux
+* [ ] Mise en place d’une **file d’attente** (queue) pour gérer les copies de fichiers
+* [ ] Génération automatique d’un **rapport ClamAV** dans le répertoire OUT de l’utilisateur
+* [ ] Ajout de paramètres pour basculer entre **mode unidirectionnel** et **bidirectionnel**
+* [ ] Documentation détaillée pour un **déploiement en production** sécurisé
+* [ ] (Roadmap) Développement d’une **interface graphique (GUI)** pour simplifier l’administration
 
 ---
 
