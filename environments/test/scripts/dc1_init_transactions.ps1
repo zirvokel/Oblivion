@@ -11,16 +11,37 @@ $svc      = 'svc_relay_dom1'
 
 Write-Host "Domaine: $($domain.DNSRoot) ($netbios)"
 
+if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Domain Groups'")) {
+    New-ADOrganizationalUnit -Name 'Domain Groups'
+    Write-Host "OU Créée: Domain Groups"
+} else {
+    Write-Host "OU Ok: Domain Groups"
+}
+
+if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Domain Users'")) {
+    New-ADOrganizationalUnit -Name 'Domain Users'
+    Write-Host "OU Créée: Domain Users"
+} else {
+    Write-Host "OU Ok: Domain Users"
+}
+
+if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Comptes de service'")) {
+    New-ADOrganizationalUnit -Name 'Comptes de service'
+    Write-Host "OU Créée: Comptes de service"
+} else {
+    Write-Host "OU Ok: Comptes de service"
+}
+
 if (-not (Get-ADGroup -Filter "SamAccountName -eq '$group'")) {
-  New-ADGroup -Name $group -SamAccountName $group -GroupCategory Security -GroupScope Global -Path "CN=Users,$domainDN" | Out-Null
+  New-ADGroup -Name $group -SamAccountName $group -GroupCategory Security -GroupScope Global -Path "OU=Domain Groups,$domainDN" | Out-Null
   Write-Host "Groupe créé: $group"
 } else {
   Write-Host "Groupe OK: $group"
 }
 
 if (-not (Get-ADUser -Filter "SamAccountName -eq '$svc'")) {
-  $pwd = Read-Host -AsSecureString "Mot de passe pour $svc"
-  New-ADUser -Name $svc -SamAccountName $svc -Enabled $true -AccountPassword $pwd `
+  $password = Read-Host -AsSecureString "Mot de passe pour $svc"
+  New-ADUser -Name $svc -SamAccountName $svc -Enabled $true -AccountPassword $password `
     -PasswordNeverExpires $true -CannotChangePassword $true -Path "OU=Comptes de service,$domainDN" `
     -Description "Service relay DOM1" | Out-Null
   Write-Host "Compte service créé: $svc"
