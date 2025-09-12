@@ -1,3 +1,11 @@
+#Requires -Modules ActiveDirectory
+param(
+  [Parameter(Mandatory=$true)][string]$FirstName,
+  [Parameter(Mandatory=$true)][string]$LastName,
+  [Parameter(Mandatory=$true)][string]$SamBase,
+  [Parameter(Mandatory=$true)][securestring]$Password
+)
+
 Import-Module ActiveDirectory -ErrorAction Stop
 
 $ad      = Get-ADDomain
@@ -11,11 +19,6 @@ switch ($NetBIOS) {
   default   { Write-Host "Domaine inattendu: $NetBIOS" -ForegroundColor Red; exit 1 }
 }
 
-$FirstName = Read-Host "Prénom"
-$LastName  = Read-Host "Nom"
-$SamBase   = Read-Host "Login de base (ex: jdupont)"
-$Password  = Read-Host "Mot de passe initial" -AsSecureString
-
 if ([string]::IsNullOrWhiteSpace($FirstName) -or
     [string]::IsNullOrWhiteSpace($LastName)  -or
     [string]::IsNullOrWhiteSpace($SamBase)) {
@@ -25,6 +28,25 @@ if ([string]::IsNullOrWhiteSpace($FirstName) -or
 
 $Sam = "$SamBase$Suffix"
 $UPN = "$Sam@$($ad.DNSRoot)"
+
+$UsersOU_DN  = "OU=Domain Users,$($ad.DistinguishedName)"
+$GroupsOU_DN = "OU=Domain Groups,$($ad.DistinguishedName)"
+
+function Resolve-OU {
+  param(
+    [Parameter(Mandatory)] [string]$Preferred,
+    [Parameter(Mandatory)] [string]$Fallback
+  )
+  try {
+    Get-ADOrganizationalUnit -Identity $Preferred -ErrorAction Stop | Out-Null
+    return $Preferred
+  } catch {
+    return $Fallback
+  }
+}
+
+$UserPath  = Resolve-OU -Preferred $UsersOU_DN  -Fallback $ad.UsersContainer
+$GroupPath = Resolve-OU -Preferred $GroupsOU_DN -Fallback $ad.UsersContainer
 
 function Resolve-LocalPath {
   param([Parameter(Mandatory)][string]$SharePath)
@@ -37,9 +59,7 @@ function Resolve-LocalPath {
   if ($SharePath -match '^\\\\([^\\]+)\\(.+)$') {
     $TargetHost = $Matches[1]
     $ShareName  = $Matches[2]
-    if ($thisNames -contains $TargetHost) {
-      return "C:\$ShareName"
-    }
+    if ($thisNames -contains $TargetHost) { return "C:\$ShareName" }
   }
   return $SharePath
 }
@@ -52,10 +72,7 @@ function Invoke-Cmd {
 }
 
 function Invoke-Icacls {
-  param(
-    [Parameter(Mandatory)][string]$Args,
-    [int]$Retry = 3
-  )
+  param([Parameter(Mandatory)][string]$Args, [int]$Retry = 3)
   for ($i=1; $i -le $Retry; $i++) {
     $rc = Invoke-Cmd -CommandLine ("icacls " + $Args)
     if ($rc -eq 0) { return $true }
@@ -67,11 +84,9 @@ function Invoke-Icacls {
 function Ensure-Ownership {
   param([Parameter(Mandatory)][string]$Path)
   $pQuoted = '"' + $Path + '"'
-
-  $null = Invoke-Cmd -CommandLine "takeown /F $pQuoted /A /R /D Y"
-  if ($LASTEXITCODE -ne 0) { $null = Invoke-Cmd -CommandLine "takeown /F $pQuoted /A /R /D O" }
-  if ($LASTEXITCODE -ne 0) { $null = Invoke-Cmd -CommandLine "takeown /F $pQuoted /A /R" }
-
+  $rc = Invoke-Cmd -CommandLine "takeown /F $pQuoted /A /R /D Y"
+  if ($rc -ne 0) { $rc = Invoke-Cmd -CommandLine "takeown /F $pQuoted /A /R /D O" }
+  if ($rc -ne 0) { $rc = Invoke-Cmd -CommandLine "takeown /F $pQuoted /A /R" }
   $null = Invoke-Cmd -CommandLine "icacls $pQuoted /setowner `"*S-1-5-32-544`" /T /C"
 }
 
@@ -80,35 +95,48 @@ $SID_SYSTEM        = "*S-1-5-18"
 $SID_BUILTIN_USERS = "*S-1-5-32-545"
 $SID_AUTH_USERS    = "*S-1-5-11"
 $SID_EVERYONE      = "*S-1-1-0"
+$DomainAdminsSid   = ($ad.DomainSID.Value.Trim()) + "-512"
+$SID_DOMAIN_ADMINS = "*$DomainAdminsSid"
 
-$DomainAdminsSid    = ($ad.DomainSID.Value.Trim()) + "-512"
-$SID_DOMAIN_ADMINS  = "*$DomainAdminsSid"
-
-if (-not (Get-ADGroup -Filter 'Name -eq "DMZ_2_ADM"' -ErrorAction SilentlyContinue)) {
-  New-ADGroup -Name $GroupName -SamAccountName $GroupName -GroupScope Global `
-    -Path "OU=Groupes,$($ad.DistinguishedName)" `
-    -Description "Autorisation d'utiliser la passerelle Transactions" | Out-Null
-  Write-Host "Groupe $GroupName créé." -ForegroundColor Yellow
+if (-not (Get-ADGroup -Filter "Name -eq '$GroupName'" -ErrorAction SilentlyContinue)) {
+  try {
+    New-ADGroup -Name $GroupName -SamAccountName $GroupName -GroupScope Global `
+      -Path $GroupPath `
+      -Description "Autorisation d'utiliser la passerelle Transactions" -ErrorAction Stop | Out-Null
+    Write-Host "Groupe $GroupName créé." -ForegroundColor Yellow
+  } catch {
+    Write-Host "Échec création groupe $GroupName : $_" -ForegroundColor Red
+    exit 1
+  }
 }
+$group = Get-ADGroup -Identity $GroupName -ErrorAction Stop
 
-if (-not (Get-ADUser -Filter "SamAccountName -eq '$Sam'" -ErrorAction SilentlyContinue)) {
-  New-ADUser `
-    -Name "$FirstName $LastName" `
-    -SamAccountName $Sam `
-    -UserPrincipalName $UPN `
-    -GivenName $FirstName `
-    -Surname $LastName `
-    -AccountPassword $Password `
-    -Enabled $true `
-    -ChangePasswordAtLogon $true `
-    -Path "OU=Utilisateurs,$($ad.DistinguishedName)"
-  Write-Host "Utilisateur $Sam créé." -ForegroundColor Green
+$user = Get-ADUser -Filter "SamAccountName -eq '$Sam'" -ErrorAction SilentlyContinue
+if (-not $user) {
+  try {
+    $user = New-ADUser `
+      -Name "$FirstName $LastName" `
+      -SamAccountName $Sam `
+      -UserPrincipalName $UPN `
+      -GivenName $FirstName `
+      -Surname $LastName `
+      -AccountPassword $Password `
+      -Enabled $true `
+      -ChangePasswordAtLogon $true `
+      -Path $UserPath `
+      -PassThru `
+      -ErrorAction Stop
+    Write-Host "Utilisateur $Sam créé." -ForegroundColor Green
+  } catch {
+    Write-Host "Échec création utilisateur $Sam : $_" -ForegroundColor Red
+    exit 1
+  }
 } else {
   Write-Host "Utilisateur $Sam existe déjà (aucune création)." -ForegroundColor Yellow
 }
 
 try {
-  Add-ADGroupMember -Identity $GroupName -Members $Sam -ErrorAction Stop
+  Add-ADGroupMember -Identity $group.DistinguishedName -Members $user.DistinguishedName -ErrorAction Stop
   Write-Host "Ajouté au groupe $GroupName." -ForegroundColor Green
 } catch {
   if (-not ($_ -match 'already a member')) {
@@ -136,7 +164,6 @@ $null = Invoke-Icacls ("`"$UserRoot`" /remove:g `"$(${SID_BUILTIN_USERS})`" `"$(
 $null = Invoke-Icacls ("`"$UserRoot`" /remove:g `"$(${SID_EVERYONE})`"")
 
 $null = Invoke-Icacls ("`"$UserRoot`" /grant:r `"$(${SID_CREATOR_OWNER}):(OI)(CI)(IO)(F)`"")
-
 $null = Invoke-Icacls ("`"$UserRoot`" /grant:r `"$(${SID_SYSTEM}):(OI)(CI)(F)`"")
 $null = Invoke-Icacls ("`"$UserRoot`" /grant:r `"$(${SID_DOMAIN_ADMINS}):(OI)(CI)(F)`"")
 
@@ -149,7 +176,12 @@ $null = Invoke-Icacls ("`"$InPath`"  /inheritance:e")
 $null = Invoke-Icacls ("`"$OutPath`" /inheritance:e")
 
 $ShareName = Split-Path -Path $ShareLocal -Leaf
-$UNC = "\\$($env:COMPUTERNAME)\$ShareName\$Sam"
+if ($SharePath -match '^\\\\([^\\]+)\\([^\\]+)') {
+  $UNCBase = "\\$($Matches[1])\$($Matches[2])"
+} else {
+  $UNCBase = "\\$($env:COMPUTERNAME)\$ShareName"
+}
+$UNC = "$UNCBase\$Sam"
 
 Write-Host ""
 Write-Host "  Utilisateur: $Sam" -ForegroundColor Green
