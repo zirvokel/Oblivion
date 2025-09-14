@@ -11,18 +11,18 @@ $svc      = 'svc_relay_dom1'
 
 Write-Host "Domaine: $($domain.DNSRoot) ($netbios)"
 
-if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Domain Groups'")) {
-    New-ADOrganizationalUnit -Name 'Domain Groups'
-    Write-Host "OU Créée: Domain Groups"
+if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Groupes du domaine'")) {
+    New-ADOrganizationalUnit -Name 'Groupes du domaine'
+    Write-Host "OU Créée: Groupes du domaine"
 } else {
-    Write-Host "OU Ok: Domain Groups"
+    Write-Host "OU Ok: Groupes du domaine"
 }
 
-if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Domain Users'")) {
-    New-ADOrganizationalUnit -Name 'Domain Users'
-    Write-Host "OU Créée: Domain Users"
+if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Utilisateurs du domaine'")) {
+    New-ADOrganizationalUnit -Name 'Utilisateurs du domaine'
+    Write-Host "OU Créée: Utilisateurs du domaine"
 } else {
-    Write-Host "OU Ok: Domain Users"
+    Write-Host "OU Ok: Utilisateurs du domaine"
 }
 
 if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Comptes de service'")) {
