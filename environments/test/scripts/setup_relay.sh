@@ -30,7 +30,7 @@ pick_ifaces() {
   local i1="${IFACE_DOM1:-}" i2="${IFACE_DOM2:-}"
   if [[ -z "$i1" || -z "$i2" ]]; then
     echo "Interfaces détectées :"
-    ip -o link show | awk -F': ' '$2!="lo"{print "  - "$2" (MAC " $2 ")"}' | sed 's/ (MAC \(.*\))/ (MAC '"$(for i in /sys/class/net/*/address; do printf "%s " "$(cat "$i")"; done)"')/; s/ .*//'
+    ip -o link show | awk -F': ' '$2!="lo"{print "  - "$2}'
     read -rp "Interface DOM1 (ex: enp0s3) : " i1
     read -rp "Interface DOM2 (ex: enp0s8) : " i2
   fi
@@ -56,7 +56,7 @@ config_ips() {
 install_pkgs() {
   say "=== 2) Paquets ==="
   apt-get update -y || true
-  apt-get install -y --no-install-recommends cifs-utils rsync smbclient
+  apt-get install -y --no-install-recommends cifs-utils rsync smbclient coreutils util-linux psmisc
   mkdir -p "$MNT1" "$MNT2" "$LOGDIR"
   umask 077
 }
@@ -87,103 +87,202 @@ setup_fstab_and_mounts() {
 //$DOM2_DC_IP/$SHARE $MNT2 cifs credentials=/root/.cred_dom2,vers=3.0,sec=ntlmssp,uid=0,gid=0,file_mode=0640,dir_mode=0750,soft,noperm 0 0
 EOF
 
-  sudo systemctl daemon-reload || true
-  sudo mount -a || true
+  systemctl daemon-reload || true
+  mount -a || true
   echo "Montages actifs :"
-  sudo mount | grep -E "$MNT1|$MNT2" || echo "  (pas encore monté)"
+  mount | grep -E "$MNT1|$MNT2" || echo "  (pas encore monté)"
 }
 
 install_sync_script() {
-  say "=== 4) Script de synchronisation (bi-directionnel) ==="
+  say "=== 4) Script de synchronisation (bi-directionnel) + logs verbeux ==="
   cat >/usr/local/sbin/ftbridge_sync.sh <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
+# ------------ Configuration locale ------------
 LOG="/var/log/ftbridge/sync.log"
 DOM1="/mnt/dom1_transactions"
 DOM2="/mnt/dom2_transactions"
 LOCK="/run/ftbridge.sync.lock"
+LOG_LEVEL="${LOG_LEVEL:-DEBUG}"   # DEBUG|INFO|WARN|ERROR
+RSYNC_PARTIAL_DIR=".rsync-partial"
 
-log(){ printf "[%(%F %T)T] %s\n" -1 "$*" >>"$LOG"; }
+# ------------ Utilitaires de log ------------
+_lvl_num(){ case "${1^^}" in DEBUG) echo 10;; INFO) echo 20;; WARN) echo 30;; ERROR) echo 40;; *) echo 20;; esac; }
+_should_log(){ [[ $(_lvl_num "$1") -ge $(_lvl_num "$LOG_LEVEL") ]]; }
+log(){ local lvl="${1:-INFO}"; shift || true; _should_log "$lvl" || return 0; printf "[%(%F %T)T] %-5s pid=%s %s\n" -1 "${lvl^^}" "$$" "$*" >>"$LOG"; }
+log_kv(){ local lvl="${1:-INFO}"; shift; _should_log "$lvl" || return 0; printf "[%(%F %T)T] %-5s pid=%s " -1 "${lvl^^}" "$$" >>"$LOG"; printf "%s=%q " "$@" >>"$LOG"; printf "\n" >>"$LOG"; }
 
+# ------------ Mapping des répertoires utilisateurs ------------
 map_to_dom2(){
   local u="$1"
-  if [[ "$u" == *".dmz" ]];    then echo "${u%.dmz}.adm";  return; fi
-  if [[ "$u" == *"_in"  ]];   then echo "${u%_in}_out";    return; fi
+  if [[ "$u" == *".dmz" ]]; then echo "${u%.dmz}.adm"; return; fi
+  if [[ "$u" == *"_in"  ]]; then echo "${u%_in}_out"; return; fi
   echo "$u"
 }
 map_to_dom1(){
   local u="$1"
-  if [[ "$u" == *".adm" ]];    then echo "${u%.adm}.dmz";  return; fi
-  if [[ "$u" == *"_out" ]];   then echo "${u%_out}_in";    return; fi
+  if [[ "$u" == *".adm" ]]; then echo "${u%.adm}.dmz"; return; fi
+  if [[ "$u" == *"_out" ]]; then echo "${u%_out}_in"; return; fi
   echo "$u"
 }
 
+# ------------ Vérifs montages & infos FS ------------
 ensure_mount() {
   local p="$1"
   if ! mountpoint -q "$p"; then
-    log "Montage absent: $p -> tentative mount"
-    mount "$p" 2>>"$LOG" || { log "Échec mount $p"; return 1; }
+    log WARN "Montage absent: $p -> tentative mount"
+    if ! mount "$p" >>"$LOG" 2>&1; then
+      log ERROR "Échec du montage: $p"
+      return 1
+    fi
   fi
+  local dev opts
+  dev="$(findmnt -n -o SOURCE --target "$p" || true)"
+  opts="$(findmnt -n -o OPTIONS --target "$p" || true)"
+  local df_line
+  df_line="$(df -hP "$p" | awk 'NR==2{print "size="$2,"used="$3,"avail="$4,"use%="$5}')"
+  log_kv INFO path "$p" device "$dev" options "$opts" $df_line
   return 0
 }
 
+# ------------ Détection de stabilité + transfert ------------
+# Correctif: on envoie les fichiers individuellement depuis "$src/" vers "$dst/"
+# pour éviter d'embarquer des chemins absolus (plus de répertoires "mnt/...").
+# On ne supprime jamais le dossier IN lui-même.
 stable_push() {
-  local src="$1" dst="$2"
-  [[ -d "$src" ]] || return 0
+  local src="$1" dst="$2" direction="$3"
+  [[ -d "$src" ]] || { log DEBUG "Source inexistante: $src"; return 0; }
   mkdir -p "$dst"
+
   shopt -s nullglob
-  local moved=0
+  local files=()
   for f in "$src"/*; do
-    [[ -f "$f" ]] || continue
-    local s1 s2
-    s1=$(stat -c%s "$f" 2>/dev/null || echo -1)
-    sleep 2
-    s2=$(stat -c%s "$f" 2>/dev/null || echo -2)
-    if [[ "$s1" -ne "$s2" || "$s1" -lt 0 ]]; then
-      log "Skip (instable): $f"
-      continue
-    fi
-    moved=1
+    [[ -f "$f" ]] && files+=("$f")
   done
-  rsync -rt --partial --partial-dir=.rsync-partial --remove-source-files "$src/" "$dst/" >>"$LOG" 2>&1 || true
-  return $moved
+
+  log INFO "Analyse stabilité" "src=$src" "dst=$dst" "candidats=${#files[@]}"
+
+  local stable=()
+  for f in "${files[@]}"; do
+    local size1 size2 mtime sha
+    size1=$(stat -c%s "$f" 2>/dev/null || echo -1)
+    mtime=$(stat -c%y "$f" 2>/dev/null || echo "n/a")
+    sleep 2
+    size2=$(stat -c%s "$f" 2>/dev/null || echo -2)
+    if [[ "$size1" -ge 0 && "$size1" -eq "$size2" ]]; then
+      if command -v sha256sum >/dev/null 2>&1; then
+        sha="$(sha256sum -- "$f" | awk '{print $1}')"
+      else
+        sha="sha256:n/a"
+      fi
+      log_kv INFO file "$f" event "QUEUE" size "$size1" mtime "$mtime" sha256 "$sha" dir "$direction"
+      stable+=("$f")
+    else
+      log_kv WARN file "$f" event "SKIP_UNSTABLE" size1 "$size1" size2 "$size2" mtime "$mtime" dir "$direction"
+    fi
+  done
+
+  [[ ${#stable[@]} -gt 0 ]] || { log INFO "Aucun fichier stable à transférer (src=$src)"; return 0; }
+
+  local ok=0 fail=0
+  for f in "${stable[@]}"; do
+    # On capture la taille AVANT transfert (car --remove-source-files efface la source si OK)
+    local fsize
+    fsize=$(stat -c%s "$f" 2>/dev/null || echo 0)
+    if rsync -t --partial --partial-dir="$RSYNC_PARTIAL_DIR" --remove-source-files \
+             --info=ALL2,FLIST2,PROGRESS2 --itemize-changes --human-readable \
+             -- "$f" "$dst/" >>"$LOG" 2>&1; then
+      log_kv INFO event "XFER" dir "$direction" path "$f" to "$dst/" size "$fsize"
+      ((ok++))
+    else
+      log_kv ERROR event "XFER_FAIL" dir "$direction" path "$f"
+      ((fail++))
+    fi
+  done
+
+  log_kv INFO event "RSYNC_SUMMARY" dir "$direction" ok "$ok" failed "$fail"
+
+  # Nettoie uniquement d'éventuels SOUS-dossiers vides (ne touche pas "$src" lui-même)
+  find "$src" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+
+  return 0
 }
 
+# ------------ Boucle principale ------------
 main() {
   exec 9>"$LOCK" || exit 0
   if ! flock -n 9; then
-    log "Run déjà en cours, on saute."
+    log WARN "Exécution déjà en cours, abandon du cycle."
     exit 0
   fi
+
+  local start_ts end_ts
+  start_ts=$(date +%s)
+
+  log INFO "=== CYCLE DEBUT ==="
+  log_kv INFO kernel "$(uname -r)" hostname "$(hostname -f 2>/dev/null || hostname)" \
+                 user "$(id -un)" pid "$$" sh "$(bash --version | head -1)"
 
   ensure_mount "$DOM1" || exit 0
   ensure_mount "$DOM2" || exit 0
 
-  log "=== CYCLE ==="
-
+  # DOM1 -> DOM2 (IN -> OUT)
   while IFS= read -r -d '' uroot; do
     u="$(basename "$uroot")"
-    [[ -d "$uroot/IN" ]] || { log "DOM1: $u sans IN, skip"; continue; }
+    if [[ ! -d "$uroot/IN" ]]; then
+      log_kv DEBUG event "NO_IN" user "$u" base "$uroot"
+      continue
+    fi
     v="$(map_to_dom2 "$u")"
     dst="$DOM2/$v/OUT"
-    log "DOM1->DOM2 : $u/IN -> $v/OUT"
-    stable_push "$uroot/IN" "$dst" || true
+    log_kv INFO event "FLOW" dir "DOM1->DOM2" from "$uroot/IN" to "$dst" user_src "$u" user_dst "$v"
+    mkdir -p "$dst"
+    stable_push "$uroot/IN" "$dst" "DOM1->DOM2" || true
   done < <(find "$DOM1" -mindepth 1 -maxdepth 1 -type d -print0)
 
+  # DOM2 -> DOM1 (IN -> OUT)
   while IFS= read -r -d '' vroot; do
     v="$(basename "$vroot")"
-    [[ -d "$vroot/IN" ]] || { log "DOM2: $v sans IN, skip"; continue; }
+    if [[ ! -d "$vroot/IN" ]]; then
+      log_kv DEBUG event "NO_IN" user "$v" base "$vroot"
+      continue
+    fi
     u="$(map_to_dom1 "$v")"
     dst="$DOM1/$u/OUT"
-    log "DOM2->DOM1 : $v/IN -> $u/OUT"
-    stable_push "$vroot/IN" "$dst" || true
+    log_kv INFO event "FLOW" dir "DOM2->DOM1" from "$vroot/IN" to "$dst" user_src "$v" user_dst "$u"
+    mkdir -p "$dst"
+    stable_push "$vroot/IN" "$dst" "DOM2->DOM1" || true
   done < <(find "$DOM2" -mindepth 1 -maxdepth 1 -type d -print0)
+
+  end_ts=$(date +%s)
+  local dur=$(( end_ts - start_ts ))
+  log_kv INFO event "CYCLE_END" duration_s "$dur"
+  log INFO "=== CYCLE FIN (${dur}s) ==="
 }
 
 main
 EOF
   chmod +x /usr/local/sbin/ftbridge_sync.sh
   : > "$LOGFILE"
+}
+
+install_logrotate() {
+  say "=== 4b) logrotate pour $LOGFILE ==="
+  cat >/etc/logrotate.d/ftbridge <<EOF
+$LOGFILE {
+  daily
+  rotate 14
+  compress
+  missingok
+  notifempty
+  create 0640 root root
+  sharedscripts
+  postrotate
+    systemctl kill -s USR1 $SERVICE_NAME 2>/dev/null || true
+  endscript
+}
+EOF
 }
 
 install_systemd_timer() {
@@ -198,11 +297,13 @@ RequiresMountsFor=$MNT1 $MNT2
 
 [Service]
 Type=oneshot
+Environment=LOG_LEVEL=DEBUG
 ExecStart=/usr/local/sbin/ftbridge_sync.sh
 Nice=10
 IOSchedulingClass=idle
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=ftbridge-sync
 
 [Install]
 WantedBy=multi-user.target
@@ -222,8 +323,8 @@ Unit=$SERVICE_NAME
 WantedBy=timers.target
 EOF
 
-  sudo systemctl daemon-reload
-  sudo systemctl enable --now $TIMER_NAME
+  systemctl daemon-reload
+  systemctl enable --now $TIMER_NAME
 }
 
 need_root
@@ -233,13 +334,15 @@ install_pkgs
 write_creds
 setup_fstab_and_mounts
 install_sync_script
+install_logrotate
 install_systemd_timer
 
 say "=== OK ===
 - Interfaces : DOM1=$IFACE_DOM1 ($IP_DOM1) / DOM2=$IFACE_DOM2 ($IP_DOM2)
 - Montages   : $MNT1 et $MNT2 (fstab)
 - Script     : /usr/local/sbin/ftbridge_sync.sh
-- Logs       : $LOGFILE
+- Logs       : $LOGFILE (rotation quotidienne, 14 archives)
 - Service    : $SERVICE_NAME
 - Timer      : $TIMER_NAME (toutes ~10s, auto au boot)
+- Niveau log : LOG_LEVEL=DEBUG (modifiable dans le service)
 "
