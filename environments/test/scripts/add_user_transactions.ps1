@@ -29,8 +29,8 @@ if ([string]::IsNullOrWhiteSpace($FirstName) -or
 $Sam = "$SamBase$Suffix"
 $UPN = "$Sam@$($ad.DNSRoot)"
 
-$UsersOU_DN  = "OU=Domain Users,$($ad.DistinguishedName)"
-$GroupsOU_DN = "OU=Domain Groups,$($ad.DistinguishedName)"
+$UsersOU_DN  = "OU=Utilisateurs du domaine,$($ad.DistinguishedName)"
+$GroupsOU_DN = "OU=Groupes du domaine,$($ad.DistinguishedName)"
 
 function Resolve-OU {
   param(
@@ -192,3 +192,4 @@ Write-Host "   - SYSTEM (SID *S-1-5-18) (F)"
 Write-Host "   - $UserAccount (M)"
 Write-Host "   - $SvcAccount (M)"
 Write-Host "   - Domain Admins ($SID_DOMAIN_ADMINS) (F)"
+
