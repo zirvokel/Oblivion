@@ -56,9 +56,16 @@ config_ips() {
 install_pkgs() {
   say "=== 2) Paquets ==="
   apt-get update -y || true
-  apt-get install -y --no-install-recommends cifs-utils rsync smbclient coreutils util-linux psmisc
-  mkdir -p "$MNT1" "$MNT2" "$LOGDIR"
+  # + ClamAV pour le scan
+  apt-get install -y --no-install-recommends cifs-utils rsync smbclient coreutils util-linux psmisc clamav clamav-freshclam
+  mkdir -p "$MNT1" "$MNT2" "$LOGDIR" /var/quarantine/ftbridge
+  chmod 700 /var/quarantine/ftbridge
   umask 077
+
+  # Mise à jour des signatures sans conflit de verrou (le service peut déjà tourner)
+  systemctl stop clamav-freshclam >/dev/null 2>&1 || true
+  freshclam --stdout || true
+  systemctl enable --now clamav-freshclam >/dev/null 2>&1 || true
 }
 
 write_creds() {
@@ -94,7 +101,7 @@ EOF
 }
 
 install_sync_script() {
-  say "=== 4) Script de synchronisation (bi-directionnel) + logs verbeux ==="
+  say "=== 4) Script de synchronisation (bi-directionnel) + ClamAV + logs verbeux ==="
   cat >/usr/local/sbin/ftbridge_sync.sh <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -106,6 +113,11 @@ DOM2="/mnt/dom2_transactions"
 LOCK="/run/ftbridge.sync.lock"
 LOG_LEVEL="${LOG_LEVEL:-DEBUG}"   # DEBUG|INFO|WARN|ERROR
 RSYNC_PARTIAL_DIR=".rsync-partial"
+
+# ClamAV
+CLAMSCAN_BIN="${CLAMSCAN_BIN:-/usr/bin/clamscan}"
+QUARANTINE_DIR="${QUARANTINE_DIR:-/var/quarantine/ftbridge}"
+REPORT_SUFFIX="_clamav"  # le rapport s'appellera <nom_fichier>_clamav
 
 # ------------ Utilitaires de log ------------
 _lvl_num(){ case "${1^^}" in DEBUG) echo 10;; INFO) echo 20;; WARN) echo 30;; ERROR) echo 40;; *) echo 20;; esac; }
@@ -146,14 +158,13 @@ ensure_mount() {
   return 0
 }
 
-# ------------ Détection de stabilité + transfert ------------
+# ------------ Détection de stabilité + transfert + ClamAV ------------
 # Correctif: on envoie les fichiers individuellement depuis "$src/" vers "$dst/"
-# pour éviter d'embarquer des chemins absolus (plus de répertoires "mnt/...").
-# On ne supprime jamais le dossier IN lui-même.
+# pour éviter d'embarquer des chemins absolus. On ne supprime jamais "$src" lui-même.
 stable_push() {
   local src="$1" dst="$2" direction="$3"
   [[ -d "$src" ]] || { log DEBUG "Source inexistante: $src"; return 0; }
-  mkdir -p "$dst"
+  mkdir -p "$dst" "$QUARANTINE_DIR"
 
   shopt -s nullglob
   local files=()
@@ -185,23 +196,103 @@ stable_push() {
 
   [[ ${#stable[@]} -gt 0 ]] || { log INFO "Aucun fichier stable à transférer (src=$src)"; return 0; }
 
-  local ok=0 fail=0
+  local ok=0 fail=0 infected=0
+  local clam_version
+  clam_version="$($CLAMSCAN_BIN -V 2>/dev/null || echo "clamscan n/a")"
+
+  # pour nommer les dossiers de quarantaine par direction
+  local dirdisp="${direction//->/_to_}"
+
   for f in "${stable[@]}"; do
-    # On capture la taille AVANT transfert (car --remove-source-files efface la source si OK)
-    local fsize
+    local fsize base report_tmp report_name verdict sig scan_rc scan_out
+    base="$(basename "$f")"
+    report_name="${base}${REPORT_SUFFIX}"
     fsize=$(stat -c%s "$f" 2>/dev/null || echo 0)
-    if rsync -t --partial --partial-dir="$RSYNC_PARTIAL_DIR" --remove-source-files \
-             --info=ALL2,FLIST2,PROGRESS2 --itemize-changes --human-readable \
-             -- "$f" "$dst/" >>"$LOG" 2>&1; then
-      log_kv INFO event "XFER" dir "$direction" path "$f" to "$dst/" size "$fsize"
-      ((ok++))
+
+    # --- Scan ClamAV ---
+    if [[ -x "$CLAMSCAN_BIN" ]]; then
+      if scan_out="$("$CLAMSCAN_BIN" --no-summary --stdout -- "$f" 2>&1)"; then
+        scan_rc=0
+      else
+        scan_rc=$?
+      fi
+      if (( scan_rc == 0 )); then
+        verdict="CLEAN"
+        sig=""
+      elif (( scan_rc == 1 )); then
+        verdict="INFECTED"
+        # extrait la signature
+        sig="$(awk -F': ' '/ FOUND$/{sub(/ FOUND$/,"",$2);print $2}' <<<"$scan_out" | head -1)"
+        ((infected++))
+      else
+        verdict="ERROR"
+        sig="Scan error"
+        ((infected++))
+      fi
     else
-      log_kv ERROR event "XFER_FAIL" dir "$direction" path "$f"
-      ((fail++))
+      verdict="UNKNOWN"
+      sig="clamscan missing"
+      log ERROR "clamscan introuvable ($CLAMSCAN_BIN) — le fichier sera BLOQUÉ par sécurité"
+      ((infected++))
+    fi
+
+    # --- Rapport user-friendly ---
+    report_tmp="$(mktemp)"
+    {
+      echo "=== FTBridge / Rapport ClamAV ==="
+      printf "Date           : %s\n" "$(date -u '+%F %T UTC')"
+      printf "Moteur         : %s\n" "$clam_version"
+      printf "Direction      : %s\n" "$direction"
+      printf "Fichier        : %s\n" "$base"
+      printf "Taille (octets): %s\n" "$fsize"
+      printf "Source         : %s\n" "$f"
+      printf "Destination    : %s\n" "$dst/"
+      printf "Verdict        : %s\n" "$verdict"
+      [[ -n "$sig" ]] && printf "Détails        : %s\n" "$sig"
+      echo
+      if [[ "$verdict" == "CLEAN" ]]; then
+        echo "Le fichier a été transféré car aucun contenu malveillant n’a été détecté."
+      elif [[ "$verdict" == "INFECTED" ]]; then
+        echo "Le fichier a été BLOQUÉ et placé en quarantaine (non transféré) car il contient un élément malveillant."
+      else
+        echo "Le fichier a été BLOQUÉ (erreur de scan) par mesure de sécurité."
+      fi
+      echo "================================="
+    } >"$report_tmp"
+
+    # --- Action selon verdict ---
+    if [[ "$verdict" == "CLEAN" ]]; then
+      # Transfert du fichier PUIS du rapport
+      if rsync -t --partial --partial-dir="$RSYNC_PARTIAL_DIR" --remove-source-files \
+               --info=ALL2,FLIST2,PROGRESS2 --itemize-changes --human-readable \
+               -- "$f" "$dst/" >>"$LOG" 2>&1; then
+        log_kv INFO event "XFER" dir "$direction" path "$f" to "$dst/" size "$fsize"
+        ((ok++))
+      else
+        log_kv ERROR event "XFER_FAIL" dir "$direction" path "$f"
+        ((fail++))
+      fi
+      # rapport côté destination
+      rsync -t --info=NAME -- "$report_tmp" "$dst/$report_name" >>"$LOG" 2>&1 || true
+      rm -f -- "$report_tmp" || true
+
+    else
+      # INFECTED/ERROR/UNKNOWN -> on déplace en quarantaine, on ne fournit pas le fichier
+      local qdir="$QUARANTINE_DIR/$(date +%F)/$dirdisp"
+      mkdir -p "$qdir"
+      local qpath="$qdir/$base"
+      if mv -f -- "$f" "$qpath"; then
+        log_kv WARN event "QUARANTINE" dir "$direction" src "$f" qpath "$qpath" verdict "$verdict" details "$sig"
+      else
+        log_kv ERROR event "QUARANTINE_FAIL" dir "$direction" src "$f" verdict "$verdict"
+      fi
+      # fournir le rapport au destinataire pour expliquer le blocage
+      rsync -t --info=NAME -- "$report_tmp" "$dst/$report_name" >>"$LOG" 2>&1 || true
+      rm -f -- "$report_tmp" || true
     fi
   done
 
-  log_kv INFO event "RSYNC_SUMMARY" dir "$direction" ok "$ok" failed "$fail"
+  log_kv INFO event "RSYNC_SUMMARY" dir "$direction" ok "$ok" infected_blocked "$infected" failed "$fail"
 
   # Nettoie uniquement d'éventuels SOUS-dossiers vides (ne touche pas "$src" lui-même)
   find "$src" -mindepth 1 -type d -empty -delete 2>/dev/null || true
@@ -290,7 +381,7 @@ install_systemd_timer() {
 
   cat >/etc/systemd/system/$SERVICE_NAME <<EOF
 [Unit]
-Description=FTBridge sync bi-directionnelle (IN->OUT) DOM1<->DOM2
+Description=FTBridge sync bi-directionnelle (IN->OUT) DOM1<->DOM2 (+ ClamAV + quarantaine)
 After=network-online.target remote-fs.target
 Wants=network-online.target
 RequiresMountsFor=$MNT1 $MNT2
@@ -344,5 +435,7 @@ say "=== OK ===
 - Logs       : $LOGFILE (rotation quotidienne, 14 archives)
 - Service    : $SERVICE_NAME
 - Timer      : $TIMER_NAME (toutes ~10s, auto au boot)
+- Antivirus  : ClamAV (clamscan), quarantaine localisée dans /var/quarantine/ftbridge
+- Rapports   : un fichier <nom>_clamav est toujours déposé dans le OUT destinataire
 - Niveau log : LOG_LEVEL=DEBUG (modifiable dans le service)
 "
