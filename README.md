@@ -140,11 +140,11 @@ Les journaux sont stockés dans :
 
 * [x] Synchronisation bidirectionnelle fiable et robuste
 * [x] Gestion des utilisateurs et corrections des permissions
-* [ ] Intégration de **ClamAV** pour l’antivirus
+* [x] Intégration de **ClamAV** pour l’antivirus
+* [x] Journalisation plus détaillée et traçabilité
+* [x] Rapport automatique **ClamAV** déposé dans le `OUT` de l’utilisateur
+* [x] Système de **file d’attente** pour gérer les copies
 * [ ] Renforcement Linux (**pare-feu, services minimaux**)
-* [ ] Journalisation plus détaillée et traçabilité
-* [ ] Système de **file d’attente** pour gérer les copies
-* [ ] Rapport automatique **ClamAV** déposé dans le `OUT` de l’utilisateur
 * [ ] Modes de synchro configurables (**unidirectionnel/bidirectionnel**)
 * [ ] Documentation de déploiement prête pour la production
 * [ ] (Futur) Tableau de bord **GUI web** pour une administration simplifiée
