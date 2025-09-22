@@ -79,10 +79,11 @@ EOF
     chmod 640 "$MAP_FILE"
   fi
 
+  # ClamAV (signatures + daemon)
   systemctl stop clamav-freshclam >/dev/null 2>&1 || true
   freshclam --stdout || true
   systemctl enable --now clamav-freshclam >/dev/null 2>&1 || true
-  systemctl enable --now clamav-daemon >/dev/null 2>&1 || true
+  systemctl enable --now clamav-daemon   >/dev/null 2>&1 || true
 }
 
 install_firewall() {
@@ -141,7 +142,9 @@ install_sync_script() {
   say "=== 4) Script de synchronisation (écriture) ==="
   cat >"$SYNC_BIN" <<'EOF'
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -Euo pipefail
+# Ne jamais faire échouer tout le service sur une erreur ponctuelle
+trap 'rc=$?; echo "[${EPOCHREALTIME%.*}] ERROR pid=$$ erreur inattendue (rc=$rc) à la ligne ${BASH_LINENO[0]}" >>/var/log/ftbridge/sync.log; rc=0; exit $rc' ERR
 
 # ------------ Configuration ------------
 LOG="/var/log/ftbridge/sync.log"
@@ -236,10 +239,11 @@ ensure_mount() {
     log WARN "Montage absent: $p -> tentative mount"
     if ! mount "$p" >>"$LOG" 2>&1; then log ERROR "Échec du montage: $p"; return 1; fi
   fi
-  local dev="$(findmnt -n -o SOURCE --target "$p" || true)"
-  local opts="$(findmnt -n -o OPTIONS --target "$p" || true)"
-  local df_line; df_line="$(df -hP "$p" | awk 'NR==2{print "size="$2,"used="$3,"avail="$4,"use%="$5}')"
-  log_kv INFO path "$p" device "$dev" options "$opts" $df_line
+  local dev; dev="$(findmnt -n -o SOURCE --target "$p" || true)"
+  local opts; opts="$(findmnt -n -o OPTIONS --target "$p" || true)"
+  local _dev size used avail usep
+  read -r _dev size used avail usep < <(df -hP "$p" | awk 'NR==2{print $1,$2,$3,$4,$5}')
+  log_kv INFO path "$p" device "$dev" options "$opts" size "$size" used "$used" avail "$avail" use_pct "$usep"
   return 0
 }
 
@@ -255,8 +259,8 @@ stable_push() {
 
   local stable=(); declare -A SHA_CACHE=()
   for f in "${files[@]}"; do
-    local s1=$(stat -c%s "$f" 2>/dev/null || echo -1); local mt=$(stat -c%y "$f" 2>/dev/null || echo "n/a")
-    sleep 2; local s2=$(stat -c%s "$f" 2>/dev/null || echo -2)
+    local s1 s2 mt; s1=$(stat -c%s "$f" 2>/dev/null || echo -1); mt=$(stat -c%y "$f" 2>/dev/null || echo "n/a")
+    sleep 2; s2=$(stat -c%s "$f" 2>/dev/null || echo -2)
     if [[ "$s1" -ge 0 && "$s1" -eq "$s2" ]]; then
       local sha; if command -v sha256sum >/dev/null 2>&1; then sha="$(sha256sum -- "$f" | awk '{print $1}')"; else sha="sha256:n/a"; fi
       SHA_CACHE["$f"]="$sha"; log_kv INFO file "$f" event "QUEUE" size "$s1" mtime "$mt" sha256 "$sha" dir "$direction"; stable+=("$f")
@@ -270,8 +274,9 @@ stable_push() {
   local dirdisp="${direction//->/_to_}"
 
   for f in "${stable[@]}"; do
-    local base="$(basename "$f")"; local fsize=$(stat -c%s "$f" 2>/dev/null || echo 0); local sha="${SHA_CACHE["$f"]:-n/a}"
-    local report_tmp report_name verdict sig scan_rc scan_out; report_name="${base}${REPORT_SUFFIX}"
+    local base fsize report_tmp report_name verdict sig scan_rc scan_out sha
+    base="$(basename "$f")"; fsize=$(stat -c%s "$f" 2>/dev/null || echo 0); sha="${SHA_CACHE["$f"]:-n/a}"
+    report_name="${base}${REPORT_SUFFIX}"
 
     if [[ -x "$CLAMSCAN_BIN" ]]; then
       if scan_out="$("$CLAMSCAN_BIN" --no-summary --stdout -- "$f" 2>&1)"; then scan_rc=0; else scan_rc=$?; fi
@@ -353,7 +358,7 @@ main() {
     local dst="$DOM2/$dir_to/OUT"
     log_kv INFO event "FLOW" dir "DOM1->DOM2" user_src "$u" user_dst "$u2" from "$dir_from" to "$dst"
     mkdir -p "$dst"; stable_push "$dir_from" "$dst" "DOM1->DOM2" || true
-  done < <(find "$DOM1" -mindepth 1 -maxdepth 1 -type d -print0)
+  done < <(find "$DOM1" -mindepth 1 -maxdepth 1 -type d -print0 || true)
 
   # DOM2 -> DOM1 (IN -> OUT)
   while IFS= read -r -d '' vroot; do
@@ -363,13 +368,15 @@ main() {
     local dst="$DOM1/$dir_to/OUT"
     log_kv INFO event "FLOW" dir "DOM2->DOM1" user_src "$v" user_dst "$v2" from "$dir_from" to "$dst"
     mkdir -p "$dst"; stable_push "$dir_from" "$dst" "DOM2->DOM1" || true
-  done < <(find "$DOM2" -mindepth 1 -maxdepth 1 -type d -print0)
+  done < <(find "$DOM2" -mindepth 1 -maxdepth 1 -type d -print0 || true)
 
   end_ts=$(date +%s); local dur=$(( end_ts - start_ts ))
   log_kv INFO event "CYCLE_END" duration_s "$dur"; log INFO "=== CYCLE FIN (${dur}s) ==="
+  return 0
 }
 
-main
+main || true
+exit 0
 EOF
   chmod +x "$SYNC_BIN"
   : > "$LOGFILE"
