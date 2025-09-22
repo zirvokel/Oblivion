@@ -32,7 +32,6 @@ if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Comptes de service'")) {
     Write-Host "OU Ok: Comptes de service"
 }
 
-# Correction: Path cohérent (FR) pour le groupe
 if (-not (Get-ADGroup -Filter "SamAccountName -eq '$group'")) {
   New-ADGroup -Name $group -SamAccountName $group -GroupCategory Security -GroupScope Global -Path "OU=Groupes du domaine,$domainDN" | Out-Null
   Write-Host "Groupe créé: $group"
@@ -44,7 +43,7 @@ if (-not (Get-ADUser -Filter "SamAccountName -eq '$svc'")) {
   $password = Read-Host -AsSecureString "Mot de passe pour $svc"
   New-ADUser -Name $svc -SamAccountName $svc -Enabled $true -AccountPassword $password `
     -PasswordNeverExpires $true -CannotChangePassword $true -Path "OU=Comptes de service,$domainDN" `
-    -Description "Service relay DOM2" | Out-Null   # Correction description
+    -Description "Service relay DOM2" | Out-Null
   Write-Host "Compte service créé: $svc"
 } else {
   Write-Host "Compte service OK: $svc"
