@@ -107,7 +107,7 @@ $DomainAdminsSid   = ($ad.DomainSID.Value.Trim()) + "-512"
 $SID_DOMAIN_ADMINS = "*$DomainAdminsSid"
 
 # Groupe
-if (-not (Get-ADGroup -Filter "Name -eq '$GroupName'" -ErrorAction SilentlyContinue)) {
+if (-not (Get-ADGroup -Filter "SamAccountName -eq '$GroupName'" -ErrorAction SilentlyContinue)) {
   try {
     New-ADGroup -Name $GroupName -SamAccountName $GroupName -GroupScope Global `
       -Path $GroupPath `
