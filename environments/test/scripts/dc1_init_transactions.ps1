@@ -11,7 +11,6 @@ $svc      = 'svc_relay_dom1'
 
 Write-Host "Domaine: $($domain.DNSRoot) ($netbios)"
 
-# OUs
 if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Groupes du domaine'")) {
     New-ADOrganizationalUnit -Name 'Groupes du domaine' -Path $domainDN
     Write-Host "OU Créée: Groupes du domaine"
@@ -33,16 +32,13 @@ if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Comptes de service'")) {
     Write-Host "OU Ok: Comptes de service"
 }
 
-# Groupe
-$groupsOU = "OU=Groupes du domaine,$domainDN"
 if (-not (Get-ADGroup -Filter "SamAccountName -eq '$group'")) {
-  New-ADGroup -Name $group -SamAccountName $group -GroupCategory Security -GroupScope Global -Path $groupsOU | Out-Null
+  New-ADGroup -Name $group -SamAccountName $group -GroupCategory Security -GroupScope Global -Path "OU=Groupes du domaine,$domainDN" | Out-Null
   Write-Host "Groupe créé: $group"
 } else {
   Write-Host "Groupe OK: $group"
 }
 
-# Compte service
 if (-not (Get-ADUser -Filter "SamAccountName -eq '$svc'")) {
   $password = Read-Host -AsSecureString "Mot de passe pour $svc"
   New-ADUser -Name $svc -SamAccountName $svc -Enabled $true -AccountPassword $password `
@@ -54,12 +50,10 @@ if (-not (Get-ADUser -Filter "SamAccountName -eq '$svc'")) {
 }
 Add-ADGroupMember -Identity $group -Members $svc -ErrorAction SilentlyContinue
 
-# Partage
 if (-not (Test-Path $shareRoot)) { New-Item -ItemType Directory -Path $shareRoot -Force | Out-Null }
 if (-not (Get-SmbShare -Name $shareName -ErrorAction SilentlyContinue)) {
-  $domainAdmins = "$netbios\Domain Admins"
   New-SmbShare -Name $shareName -Path $shareRoot `
-    -FullAccess @("NT AUTHORITY\SYSTEM",$domainAdmins) `
+    -FullAccess @("Système","$netbios\Admins du domaine") `
     -ChangeAccess @("$netbios\$svc","$netbios\$group") | Out-Null
   Set-SmbShare -Name $shareName -FolderEnumerationMode AccessBased -Confirm:$false | Out-Null
   Set-SmbShare -Name $shareName -EncryptData $true -Confirm:$false | Out-Null
@@ -68,18 +62,13 @@ if (-not (Get-SmbShare -Name $shareName -ErrorAction SilentlyContinue)) {
   Write-Host "Partage OK: \\$env:COMPUTERNAME\$shareName"
 }
 
-# NTFS (noms neutres)
-$domainAdmins = "$netbios\Domain Admins"
-$aceAdmins = "$domainAdmins:(OI)(CI)(F)"
+$aceAdmins = "$netbios\Admins du domaine:(OI)(CI)(F)"
 $aceSvc    = "$netbios\${svc}:(OI)(CI)(M)"
 $aceGroup  = "$netbios\${group}:(RX)"
-
 icacls $shareRoot /inheritance:d | Out-Null
-icacls $shareRoot /grant:r "NT AUTHORITY\SYSTEM:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceGroup" | Out-Null
-# Supprime Usagers FR/EN s'ils existent
-icacls $shareRoot /remove:g "Users" "Authenticated Users" "Utilisateurs" "Utilisateurs authentifiés" 2>$null | Out-Null
+icacls $shareRoot /grant:r "Système:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceGroup" | Out-Null
+icacls $shareRoot /remove:g "Utilisateurs" "Utilisateurs authentifiés" 2>$null | Out-Null
 
-# Provision IN/OUT pour les membres "utilisateurs" du groupe
 $members = Get-ADGroupMember -Identity $group -Recursive |
            Where-Object { $_.objectClass -eq 'user' } |
            Get-ADUser -Properties SamAccountName
@@ -94,8 +83,8 @@ foreach ($u in $members) {
 
   $aceUser = "$netbios\${name}:(OI)(CI)(M)"
   icacls $uRoot /inheritance:d | Out-Null
-  icacls $uRoot /grant:r "NT AUTHORITY\SYSTEM:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceUser" | Out-Null
-  icacls $uRoot /remove:g "Users" "Authenticated Users" "Utilisateurs" "Utilisateurs authentifiés" 2>$null | Out-Null
+  icacls $uRoot /grant:r "Système:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceUser" | Out-Null
+  icacls $uRoot /remove:g "Utilisateurs" "Utilisateurs authentifiés" 2>$null | Out-Null
   Write-Host " - $name : IN/OUT + ACL OK"
 }
 
