@@ -33,7 +33,7 @@ if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Comptes de service'")) {
 }
 
 if (-not (Get-ADGroup -Filter "SamAccountName -eq '$group'")) {
-  New-ADGroup -Name $group -SamAccountName $group -GroupCategory Security -GroupScope Global -Path "OU=Domain Groups,$domainDN" | Out-Null
+  New-ADGroup -Name $group -SamAccountName $group -GroupCategory Security -GroupScope Global -Path "OU=Groupes du domaine,$domainDN" | Out-Null
   Write-Host "Groupe créé: $group"
 } else {
   Write-Host "Groupe OK: $group"
