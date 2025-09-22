@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# ================== Paramètres réseau / domaines ==================
 IP_DOM1="192.168.10.1/24"
 IP_DOM2="10.10.240.1/24"
 
@@ -13,14 +14,20 @@ DOM2_USER="svc_relay_dom2"
 DOM1_DOMAIN="DOM1"
 DOM2_DOMAIN="DOM2"
 
+# ================== Chemins & fichiers ==================
 MNT1="/mnt/dom1_transactions"
 MNT2="/mnt/dom2_transactions"
 LOGDIR="/var/log/ftbridge"
 LOGFILE="$LOGDIR/sync.log"
 
+CONF_DIR="/etc/ftbridge"
+MAP_FILE="$CONF_DIR/map.csv"
+
 SERVICE_NAME="ftbridge-sync.service"
 TIMER_NAME="ftbridge-sync.timer"
+SYNC_BIN="/usr/local/sbin/ftbridge_sync.sh"
 
+# ================== Utils ==================
 say(){ echo -e "$*"; }
 need_root(){ [[ $EUID -eq 0 ]] || { echo "Run as root"; exit 1; }; }
 
@@ -54,15 +61,39 @@ config_ips() {
 install_pkgs() {
   say "=== 2) Paquets ==="
   apt-get update -y || true
-  # + ClamAV (daemon pour perf), nftables pour firewall
   apt-get install -y --no-install-recommends \
     cifs-utils rsync smbclient coreutils util-linux psmisc \
     clamav clamav-freshclam clamav-daemon nftables
 
-  mkdir -p "$MNT1" "$MNT2" "$LOGDIR" /var/quarantine/ftbridge
+  mkdir -p "$MNT1" "$MNT2" "$LOGDIR" /var/quarantine/ftbridge "$CONF_DIR"
   chmod 700 /var/quarantine/ftbridge
   umask 077
 
+  # Mapping CSV initial
+  if [[ ! -f "$MAP_FILE" ]]; then
+    cat >"$MAP_FILE" <<'EOF'
+# Fichier de mapping FTBridge (CSV, séparateur virgule)
+# Lignes vides et lignes commençant par # sont ignorées.
+# En-tête (obligatoire) :
+# dom1_user,dom2_user,dom1_dir,dom2_dir
+#
+# Règles :
+# - dom1_user/dom2_user : identifiants utilisateur dans chaque domaine (SAM ou nom logique côté partage).
+# - dom1_dir/dom2_dir   : nom de dossier dans le partage "Transactions" de chaque domaine.
+#   Si vide, on prend par défaut domX_user.
+# - Au moins un couple d'identité doit être présent pour que la ligne soit utile.
+#
+# Exemples :
+#  j.doe-admin,john.doe,,          # Dossiers = j.doe-admin (DOM1) et john.doe (DOM2)
+#  app.bot,svc.app,app.bot,svc.app # Dossiers explicitement nommés
+#  jean.dupont,jean.dupont,,       # Identiques dans les deux domaines
+dom1_user,dom2_user,dom1_dir,dom2_dir
+j.doe-admin,john.doe,,
+EOF
+    chmod 640 "$MAP_FILE"
+  fi
+
+  # ClamAV (signatures + daemon)
   systemctl stop clamav-freshclam >/dev/null 2>&1 || true
   freshclam --stdout || true
   systemctl enable --now clamav-freshclam >/dev/null 2>&1 || true
@@ -83,7 +114,7 @@ EOF
 }
 
 write_creds() {
-  # Permet aussi l'utilisation de variables d'env DOM1_PASS / DOM2_PASS si définies.
+  # Permet aussi DOM1_PASS / DOM2_PASS via variables d'env (CI/CD)
   install -m 600 /dev/null /root/.cred_dom1
   if [[ -z "${DOM1_PASS:-}" ]]; then
     read -rsp "Mot de passe $DOM1_DOMAIN\\$DOM1_USER : " DOM1_PASS; echo
@@ -122,18 +153,22 @@ EOF
 }
 
 install_sync_script() {
-  say "=== 4) Script de synchronisation (bi-directionnel) + ClamAV + logs verbeux ==="
-  cat >/usr/local/sbin/ftbridge_sync.sh <<'EOF'
+  say "=== 4) Script de synchronisation (écriture complète) ==="
+  cat >"$SYNC_BIN" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ------------ Configuration locale ------------
+# ------------ Configuration ------------
 LOG="/var/log/ftbridge/sync.log"
 DOM1="/mnt/dom1_transactions"
 DOM2="/mnt/dom2_transactions"
 LOCK="/run/ftbridge.sync.lock"
 LOG_LEVEL="${LOG_LEVEL:-DEBUG}"   # DEBUG|INFO|WARN|ERROR
 RSYNC_PARTIAL_DIR=".rsync-partial"
+
+# Fichier de mapping (CSV)
+CONF_DIR="${CONF_DIR:-/etc/ftbridge}"
+MAP_FILE="${MAP_FILE:-$CONF_DIR/map.csv}"
 
 # ClamAV : privilégie clamdscan si dispo (perf), sinon clamscan
 if command -v clamdscan >/dev/null 2>&1; then
@@ -142,7 +177,7 @@ else
   CLAMSCAN_BIN="${CLAMSCAN_BIN:-/usr/bin/clamscan}"
 fi
 QUARANTINE_DIR="${QUARANTINE_DIR:-/var/quarantine/ftbridge}"
-REPORT_SUFFIX="_clamav"  # le rapport s'appellera <nom_fichier>_clamav
+REPORT_SUFFIX="_clamav"
 
 # ------------ Utilitaires de log ------------
 _lvl_num(){ case "${1^^}" in DEBUG) echo 10;; INFO) echo 20;; WARN) echo 30;; ERROR) echo 40;; *) echo 20;; esac; }
@@ -150,18 +185,124 @@ _should_log(){ [[ $(_lvl_num "$1") -ge $(_lvl_num "$LOG_LEVEL") ]]; }
 log(){ local lvl="${1:-INFO}"; shift || true; _should_log "$lvl" || return 0; printf "[%(%F %T)T] %-5s pid=%s %s\n" -1 "${lvl^^}" "$$" "$*" >>"$LOG"; }
 log_kv(){ local lvl="${1:-INFO}"; shift; _should_log "$lvl" || return 0; printf "[%(%F %T)T] %-5s pid=%s " -1 "${lvl^^}" "$$" >>"$LOG"; printf "%s=%q " "$@" >>"$LOG"; printf "\n" >>"$LOG"; }
 
-# ------------ Mapping des répertoires utilisateurs ------------
-map_to_dom2(){
+# ------------ Mapping CSV : chargement & résolution ------------
+# Format attendu (en-tête obligatoire) :
+# dom1_user,dom2_user,dom1_dir,dom2_dir
+#
+# - domX_user : identifiant côté domaine (ex. "j.doe-admin" / "john.doe")
+# - domX_dir  : nom du dossier dans le partage Transactions (si vide => domX_user)
+#
+# On construit 4 tables :
+#  - D1U->D2U, D2U->D1U  (utilisateurs)
+#  - D1D->D2D, D2D->D1D  (dossiers)
+#
+# Rechargé automatiquement si MAP_FILE est modifié (mtime).
+
+declare -A MAP_D1U_TO_D2U MAP_D2U_TO_D1U MAP_D1D_TO_D2D MAP_D2D_TO_D1D
+MAP_MTIME=0
+
+_trim_csv_field(){ local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+
+load_mapping() {
+  [[ -f "$MAP_FILE" ]] || { log WARN "Mapping absent: $MAP_FILE"; return 0; }
+  local mtime
+  mtime="$(stat -c %Y "$MAP_FILE" 2>/dev/null || echo 0)"
+  if [[ "$mtime" -eq "$MAP_MTIME" ]]; then
+    return 0
+  fi
+
+  MAP_D1U_TO_D2U=(); MAP_D2U_TO_D1U=(); MAP_D1D_TO_D2D=(); MAP_D2D_TO_D1D=()
+
+  local line n=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((n++))
+    [[ -z "${line// }" ]] && continue
+    [[ "${line:0:1}" == "#" ]] && continue
+
+    IFS=',' read -r f1 f2 f3 f4 <<<"$line"
+    if (( n == 1 )); then
+      local h1 h2 h3 h4
+      h1="$(_trim_csv_field "$f1" | tr '[:upper:]' '[:lower:]')"
+      h2="$(_trim_csv_field "$f2" | tr '[:upper:]' '[:lower:]')"
+      h3="$(_trim_csv_field "$f3" | tr '[:upper:]' '[:lower:]')"
+      h4="$(_trim_csv_field "$f4" | tr '[:upper:]' '[:lower:]')"
+      if [[ "$h1,$h2,$h3,$h4" != "dom1_user,dom2_user,dom1_dir,dom2_dir" ]]; then
+        log ERROR "Entête CSV invalide dans $MAP_FILE (ligne 1)"
+        break
+      fi
+      continue
+    fi
+
+    local d1u d2u d1d d2d
+    d1u="$(_trim_csv_field "$f1")"
+    d2u="$(_trim_csv_field "$f2")"
+    d1d="$(_trim_csv_field "$f3")"
+    d2d="$(_trim_csv_field "$f4")"
+
+    [[ -z "$d1d" && -n "$d1u" ]] && d1d="$d1u"
+    [[ -z "$d2d" && -n "$d2u" ]] && d2d="$d2u"
+    [[ -z "$d1u$d2u$d1d$d2d" ]] && continue
+
+    if [[ -n "$d1u" && -n "$d2u" ]]; then
+      MAP_D1U_TO_D2U["$d1u"]="$d2u"
+      MAP_D2U_TO_D1U["$d2u"]="$d1u"
+    fi
+    if [[ -n "$d1d" && -n "$d2d" ]]; then
+      MAP_D1D_TO_D2D["$d1d"]="$d2d"
+      MAP_D2D_TO_D1D["$d2d"]="$d1d"
+    fi
+  done <"$MAP_FILE"
+
+  MAP_MTIME="$mtime"
+  log_kv INFO event "MAP_RELOADED" file "$MAP_FILE" mtime "$MAP_MTIME"
+}
+
+# Fallback historique : substitution .dmz <-> .adm et *_in <-> *_out
+map_suffix_to_dom2(){
   local u="$1"
   if [[ "$u" == *".dmz" ]]; then echo "${u%.dmz}.adm"; return; fi
   if [[ "$u" == *"_in"  ]]; then echo "${u%_in}_out"; return; fi
   echo "$u"
 }
-map_to_dom1(){
+map_suffix_to_dom1(){
   local u="$1"
   if [[ "$u" == *".adm" ]]; then echo "${u%.adm}.dmz"; return; fi
   if [[ "$u" == *"_out" ]]; then echo "${u%_out}_in"; return; fi
   echo "$u"
+}
+
+resolve_from_dom1(){
+  local user1="$1" dir1="$2"
+  local user2 dir2
+  load_mapping
+  if [[ -n "${MAP_D1U_TO_D2U[$user1]:-}" ]]; then
+    user2="${MAP_D1U_TO_D2U[$user1]}"
+  else
+    user2="$(map_suffix_to_dom2 "$user1")"
+  fi
+  if [[ -n "${MAP_D1D_TO_D2D[$dir1]:-}" ]]; then
+    dir2="${MAP_D1D_TO_D2D[$dir1]}"
+  else
+    dir2="$user2"
+  fi
+  printf '%s;%s\n' "$user2" "$dir2"
+}
+
+resolve_from_dom2(){
+  local user2="$1" dir2="$2"
+  local user1 dir1
+  load_mapping
+  if [[ -n "${MAP_D2U_TO_D1U[$user2]:-}" ]]; then
+    user1="${MAP_D2U_TO_D1U[$user2]}"
+  else
+    user1="$(map_suffix_to_dom1 "$user2")"
+  fi
+  if [[ -n "${MAP_D2D_TO_D1D[$dir2]:-}" ]]; then
+    dir1="${MAP_D2D_TO_D1D[$dir2]}"
+  else
+    dir1="$user1"
+  fi
+  printf '%s;%s\n' "$user1" "$dir1"
 }
 
 # ------------ Vérifs montages & infos FS ------------
@@ -265,7 +406,7 @@ stable_push() {
       printf "Direction      : %s\n" "$direction"
       printf "Fichier        : %s\n" "$base"
       printf "Taille (octets): %s\n" "$fsize"
-      printf "SHA256        : %s\n" "$sha"
+      printf "SHA256         : %s\n" "$sha"
       printf "Source         : %s\n" "$f"
       printf "Destination    : %s\n" "$dst/"
       printf "Verdict        : %s\n" "$verdict"
@@ -310,7 +451,7 @@ stable_push() {
 
   log_kv INFO event "RSYNC_SUMMARY" dir "$direction" ok "$ok" infected_blocked "$infected" failed "$fail"
 
-  # Nettoyage de sous-dossiers vides + éventuels dossiers partiels
+  # Nettoyage
   find "$src" -mindepth 1 -type d -name "$RSYNC_PARTIAL_DIR" -empty -delete 2>/dev/null || true
   find "$src" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
@@ -337,30 +478,28 @@ main() {
 
   # DOM1 -> DOM2 (IN -> OUT)
   while IFS= read -r -d '' uroot; do
+    local u dir_from u2 dir_to_name dst
     u="$(basename "$uroot")"
-    if [[ ! -d "$uroot/IN" ]]; then
-      log_kv DEBUG event "NO_IN" user "$u" base "$uroot"
-      continue
-    fi
-    v="$(map_to_dom2 "$u")"
-    dst="$DOM2/$v/OUT"
-    log_kv INFO event "FLOW" dir "DOM1->DOM2" from "$uroot/IN" to "$dst" user_src "$u" user_dst "$v"
+    dir_from="$uroot/IN"
+    [[ -d "$dir_from" ]] || { log_kv DEBUG event "NO_IN" user "$u" base "$uroot"; continue; }
+    IFS=';' read -r u2 dir_to_name < <(resolve_from_dom1 "$u" "$u")
+    dst="$DOM2/$dir_to_name/OUT"
+    log_kv INFO event "FLOW" dir "DOM1->DOM2" user_src "$u" user_dst "$u2" from "$dir_from" to "$dst"
     mkdir -p "$dst"
-    stable_push "$uroot/IN" "$dst" "DOM1->DOM2" || true
+    stable_push "$dir_from" "$dst" "DOM1->DOM2" || true
   done < <(find "$DOM1" -mindepth 1 -maxdepth 1 -type d -print0)
 
   # DOM2 -> DOM1 (IN -> OUT)
   while IFS= read -r -d '' vroot; do
+    local v dir_from v2 dir_to_name dst
     v="$(basename "$vroot")"
-    if [[ ! -d "$vroot/IN" ]]; then
-      log_kv DEBUG event "NO_IN" user "$v" base "$vroot"
-      continue
-    fi
-    u="$(map_to_dom1 "$v")"
-    dst="$DOM1/$u/OUT"
-    log_kv INFO event "FLOW" dir "DOM2->DOM1" from "$vroot/IN" to "$dst" user_src "$v" user_dst "$u"
+    dir_from="$vroot/IN"
+    [[ -d "$dir_from" ]] || { log_kv DEBUG event "NO_IN" user "$v" base "$vroot"; continue; }
+    IFS=';' read -r v2 dir_to_name < <(resolve_from_dom2 "$v" "$v")
+    dst="$DOM1/$dir_to_name/OUT"
+    log_kv INFO event "FLOW" dir "DOM2->DOM1" user_src "$v" user_dst "$v2" from "$dir_from" to "$dst"
     mkdir -p "$dst"
-    stable_push "$vroot/IN" "$dst" "DOM2->DOM1" || true
+    stable_push "$dir_from" "$dst" "DOM2->DOM1" || true
   done < <(find "$DOM2" -mindepth 1 -maxdepth 1 -type d -print0)
 
   end_ts=$(date +%s)
@@ -371,7 +510,7 @@ main() {
 
 main
 EOF
-  chmod +x /usr/local/sbin/ftbridge_sync.sh
+  chmod +x "$SYNC_BIN"
   : > "$LOGFILE"
 }
 
@@ -388,7 +527,6 @@ $LOGFILE {
   create 0640 root root
   sharedscripts
   postrotate
-    # pas d'action spécifique requise
     :
   endscript
 }
@@ -400,7 +538,7 @@ install_systemd_timer() {
 
   cat >/etc/systemd/system/$SERVICE_NAME <<EOF
 [Unit]
-Description=FTBridge sync bi-directionnelle (IN->OUT) DOM1<->DOM2 (+ ClamAV + quarantaine)
+Description=FTBridge sync bi-directionnelle (IN->OUT) DOM1<->DOM2 (+ ClamAV + quarantaine + mapping)
 After=network-online.target remote-fs.target
 Wants=network-online.target
 RequiresMountsFor=$MNT1 $MNT2
@@ -408,7 +546,9 @@ RequiresMountsFor=$MNT1 $MNT2
 [Service]
 Type=oneshot
 Environment=LOG_LEVEL=DEBUG
-ExecStart=/usr/local/sbin/ftbridge_sync.sh
+Environment=MAP_FILE=$MAP_FILE
+Environment=CONF_DIR=$CONF_DIR
+ExecStart=$SYNC_BIN
 Nice=10
 IOSchedulingClass=idle
 StandardOutput=journal
@@ -437,6 +577,7 @@ EOF
   systemctl enable --now $TIMER_NAME
 }
 
+# ================== Exécution ==================
 need_root
 pick_ifaces
 config_ips
@@ -449,14 +590,10 @@ install_logrotate
 install_systemd_timer
 
 say "=== OK ===
-- Interfaces : DOM1=$IFACE_DOM1 ($IP_DOM1) / DOM2=$IFACE_DOM2 ($IP_DOM2)
-- Montages   : $MNT1 et $MNT2 (fstab, SMB 3.1.1 + seal, noexec/nosuid/nodev)
-- Script     : /usr/local/sbin/ftbridge_sync.sh
-- Logs       : $LOGFILE (rotation quotidienne + taille)
-- Service    : $SERVICE_NAME
-- Timer      : $TIMER_NAME (toutes ~10s, auto au boot)
-- Antivirus  : ClamAV daemon (clamdscan si dispo), quarantaine: /var/quarantine/ftbridge
-- Rapports   : un fichier <nom>_clamav est toujours déposé dans le OUT destinataire
-- Niveau log : LOG_LEVEL=DEBUG (modifiable dans le service)
-- Pare-feu   : nftables actif, FORWARD=DROP
+- Mapping : $MAP_FILE (rechargé automatiquement à chaque changement)
+- Script  : $SYNC_BIN
+- Montages: $MNT1 et $MNT2 (SMB 3.1.1 + seal, noexec/nosuid/nodev)
+- Logs    : $LOGFILE (rotation quotidienne + taille)
+- Service : $SERVICE_NAME + $TIMER_NAME (~10s)
+- Pare-feu: nftables actif, FORWARD=DROP
 "
