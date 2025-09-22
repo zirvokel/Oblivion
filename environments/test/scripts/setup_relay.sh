@@ -69,31 +69,16 @@ install_pkgs() {
   chmod 700 /var/quarantine/ftbridge
   umask 077
 
-  # Mapping CSV initial
+  # Mapping CSV initial si absent
   if [[ ! -f "$MAP_FILE" ]]; then
     cat >"$MAP_FILE" <<'EOF'
-# Fichier de mapping FTBridge (CSV, séparateur virgule)
-# Lignes vides et lignes commençant par # sont ignorées.
-# En-tête (obligatoire) :
-# dom1_user,dom2_user,dom1_dir,dom2_dir
-#
-# Règles :
-# - dom1_user/dom2_user : identifiants utilisateur dans chaque domaine (SAM ou nom logique côté partage).
-# - dom1_dir/dom2_dir   : nom de dossier dans le partage "Transactions" de chaque domaine.
-#   Si vide, on prend par défaut domX_user.
-# - Au moins un couple d'identité doit être présent pour que la ligne soit utile.
-#
-# Exemples :
-#  j.doe-admin,john.doe,,          # Dossiers = j.doe-admin (DOM1) et john.doe (DOM2)
-#  app.bot,svc.app,app.bot,svc.app # Dossiers explicitement nommés
-#  jean.dupont,jean.dupont,,       # Identiques dans les deux domaines
 dom1_user,dom2_user,dom1_dir,dom2_dir
-j.doe-admin,john.doe,,
+# Ajoutez des lignes au format suivant (sans #) :
+# j.doe-admin,john.doe,,
 EOF
     chmod 640 "$MAP_FILE"
   fi
 
-  # ClamAV (signatures + daemon)
   systemctl stop clamav-freshclam >/dev/null 2>&1 || true
   freshclam --stdout || true
   systemctl enable --now clamav-freshclam >/dev/null 2>&1 || true
@@ -114,7 +99,7 @@ EOF
 }
 
 write_creds() {
-  # Permet aussi DOM1_PASS / DOM2_PASS via variables d'env (CI/CD)
+  # Permet aussi DOM1_PASS / DOM2_PASS via variables d'env
   install -m 600 /dev/null /root/.cred_dom1
   if [[ -z "${DOM1_PASS:-}" ]]; then
     read -rsp "Mot de passe $DOM1_DOMAIN\\$DOM1_USER : " DOM1_PASS; echo
@@ -153,7 +138,7 @@ EOF
 }
 
 install_sync_script() {
-  say "=== 4) Script de synchronisation (écriture complète) ==="
+  say "=== 4) Script de synchronisation (écriture) ==="
   cat >"$SYNC_BIN" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -166,11 +151,10 @@ LOCK="/run/ftbridge.sync.lock"
 LOG_LEVEL="${LOG_LEVEL:-DEBUG}"   # DEBUG|INFO|WARN|ERROR
 RSYNC_PARTIAL_DIR=".rsync-partial"
 
-# Fichier de mapping (CSV)
 CONF_DIR="${CONF_DIR:-/etc/ftbridge}"
 MAP_FILE="${MAP_FILE:-$CONF_DIR/map.csv}"
 
-# ClamAV : privilégie clamdscan si dispo (perf), sinon clamscan
+# ClamAV (clamdscan si dispo)
 if command -v clamdscan >/dev/null 2>&1; then
   CLAMSCAN_BIN="${CLAMSCAN_BIN:-/usr/bin/clamdscan}"
 else
@@ -179,77 +163,45 @@ fi
 QUARANTINE_DIR="${QUARANTINE_DIR:-/var/quarantine/ftbridge}"
 REPORT_SUFFIX="_clamav"
 
-# ------------ Utilitaires de log ------------
+# ------------ Log helpers ------------
 _lvl_num(){ case "${1^^}" in DEBUG) echo 10;; INFO) echo 20;; WARN) echo 30;; ERROR) echo 40;; *) echo 20;; esac; }
 _should_log(){ [[ $(_lvl_num "$1") -ge $(_lvl_num "$LOG_LEVEL") ]]; }
 log(){ local lvl="${1:-INFO}"; shift || true; _should_log "$lvl" || return 0; printf "[%(%F %T)T] %-5s pid=%s %s\n" -1 "${lvl^^}" "$$" "$*" >>"$LOG"; }
 log_kv(){ local lvl="${1:-INFO}"; shift; _should_log "$lvl" || return 0; printf "[%(%F %T)T] %-5s pid=%s " -1 "${lvl^^}" "$$" >>"$LOG"; printf "%s=%q " "$@" >>"$LOG"; printf "\n" >>"$LOG"; }
 
-# ------------ Mapping CSV : chargement & résolution ------------
-# Format attendu (en-tête obligatoire) :
-# dom1_user,dom2_user,dom1_dir,dom2_dir
-#
-# - domX_user : identifiant côté domaine (ex. "j.doe-admin" / "john.doe")
-# - domX_dir  : nom du dossier dans le partage Transactions (si vide => domX_user)
-#
-# On construit 4 tables :
-#  - D1U->D2U, D2U->D1U  (utilisateurs)
-#  - D1D->D2D, D2D->D1D  (dossiers)
-#
-# Rechargé automatiquement si MAP_FILE est modifié (mtime).
-
+# ------------ Mapping CSV ------------
 declare -A MAP_D1U_TO_D2U MAP_D2U_TO_D1U MAP_D1D_TO_D2D MAP_D2D_TO_D1D
 MAP_MTIME=0
-
-_trim_csv_field(){ local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+_trim(){ local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
 
 load_mapping() {
   [[ -f "$MAP_FILE" ]] || { log WARN "Mapping absent: $MAP_FILE"; return 0; }
-  local mtime
-  mtime="$(stat -c %Y "$MAP_FILE" 2>/dev/null || echo 0)"
-  if [[ "$mtime" -eq "$MAP_MTIME" ]]; then
-    return 0
-  fi
+  local mtime; mtime="$(stat -c %Y "$MAP_FILE" 2>/dev/null || echo 0)"
+  [[ "$mtime" -eq "$MAP_MTIME" ]] && return 0
 
   MAP_D1U_TO_D2U=(); MAP_D2U_TO_D1U=(); MAP_D1D_TO_D2D=(); MAP_D2D_TO_D1D=()
 
   local line n=0
   while IFS= read -r line || [[ -n "$line" ]]; do
-    ((n++))
-    [[ -z "${line// }" ]] && continue
-    [[ "${line:0:1}" == "#" ]] && continue
-
+    ((n++)); [[ -z "${line// }" || "${line:0:1}" == "#" ]] && continue
     IFS=',' read -r f1 f2 f3 f4 <<<"$line"
     if (( n == 1 )); then
-      local h1 h2 h3 h4
-      h1="$(_trim_csv_field "$f1" | tr '[:upper:]' '[:lower:]')"
-      h2="$(_trim_csv_field "$f2" | tr '[:upper:]' '[:lower:]')"
-      h3="$(_trim_csv_field "$f3" | tr '[:upper:]' '[:lower:]')"
-      h4="$(_trim_csv_field "$f4" | tr '[:upper:]' '[:lower:]')"
-      if [[ "$h1,$h2,$h3,$h4" != "dom1_user,dom2_user,dom1_dir,dom2_dir" ]]; then
-        log ERROR "Entête CSV invalide dans $MAP_FILE (ligne 1)"
-        break
-      fi
+      local h1="$(_trim "$f1" | tr '[:upper:]' '[:lower:]')"
+      local h2="$(_trim "$f2" | tr '[:upper:]' '[:lower:]')"
+      local h3="$(_trim "$f3" | tr '[:upper:]' '[:lower:]')"
+      local h4="$(_trim "$f4" | tr '[:upper:]' '[:lower:]')"
+      [[ "$h1,$h2,$h3,$h4" == "dom1_user,dom2_user,dom1_dir,dom2_dir" ]] || { log ERROR "Entête CSV invalide"; break; }
       continue
     fi
-
-    local d1u d2u d1d d2d
-    d1u="$(_trim_csv_field "$f1")"
-    d2u="$(_trim_csv_field "$f2")"
-    d1d="$(_trim_csv_field "$f3")"
-    d2d="$(_trim_csv_field "$f4")"
-
+    local d1u="$(_trim "$f1")" d2u="$(_trim "$f2")" d1d="$(_trim "$f3")" d2d="$(_trim "$f4")"
     [[ -z "$d1d" && -n "$d1u" ]] && d1d="$d1u"
     [[ -z "$d2d" && -n "$d2u" ]] && d2d="$d2u"
     [[ -z "$d1u$d2u$d1d$d2d" ]] && continue
-
     if [[ -n "$d1u" && -n "$d2u" ]]; then
-      MAP_D1U_TO_D2U["$d1u"]="$d2u"
-      MAP_D2U_TO_D1U["$d2u"]="$d1u"
+      MAP_D1U_TO_D2U["$d1u"]="$d2u"; MAP_D2U_TO_D1U["$d2u"]="$d1u"
     fi
     if [[ -n "$d1d" && -n "$d2d" ]]; then
-      MAP_D1D_TO_D2D["$d1d"]="$d2d"
-      MAP_D2D_TO_D1D["$d2d"]="$d1d"
+      MAP_D1D_TO_D2D["$d1d"]="$d2d"; MAP_D2D_TO_D1D["$d2d"]="$d1d"
     fi
   done <"$MAP_FILE"
 
@@ -257,147 +209,77 @@ load_mapping() {
   log_kv INFO event "MAP_RELOADED" file "$MAP_FILE" mtime "$MAP_MTIME"
 }
 
-# Fallback historique : substitution .dmz <-> .adm et *_in <-> *_out
-map_suffix_to_dom2(){
-  local u="$1"
-  if [[ "$u" == *".dmz" ]]; then echo "${u%.dmz}.adm"; return; fi
-  if [[ "$u" == *"_in"  ]]; then echo "${u%_in}_out"; return; fi
-  echo "$u"
-}
-map_suffix_to_dom1(){
-  local u="$1"
-  if [[ "$u" == *".adm" ]]; then echo "${u%.adm}.dmz"; return; fi
-  if [[ "$u" == *"_out" ]]; then echo "${u%_out}_in"; return; fi
-  echo "$u"
-}
+# Fallback historique (.dmz <-> .adm)
+map_suffix_to_dom2(){ local u="$1"; [[ "$u" == *".dmz" ]] && { echo "${u%.dmz}.adm"; return; }; echo "$u"; }
+map_suffix_to_dom1(){ local u="$1"; [[ "$u" == *".adm" ]] && { echo "${u%.adm}.dmz"; return; }; echo "$u"; }
 
 resolve_from_dom1(){
-  local user1="$1" dir1="$2"
+  local user1="$1" dir1="$2"; load_mapping
   local user2 dir2
-  load_mapping
-  if [[ -n "${MAP_D1U_TO_D2U[$user1]:-}" ]]; then
-    user2="${MAP_D1U_TO_D2U[$user1]}"
-  else
-    user2="$(map_suffix_to_dom2 "$user1")"
-  fi
-  if [[ -n "${MAP_D1D_TO_D2D[$dir1]:-}" ]]; then
-    dir2="${MAP_D1D_TO_D2D[$dir1]}"
-  else
-    dir2="$user2"
-  fi
+  if [[ -n "${MAP_D1U_TO_D2U[$user1]:-}" ]]; then user2="${MAP_D1U_TO_D2U[$user1]}"; else user2="$(map_suffix_to_dom2 "$user1")"; fi
+  if [[ -n "${MAP_D1D_TO_D2D[$dir1]:-}" ]]; then dir2="${MAP_D1D_TO_D2D[$dir1]}"; else dir2="$user2"; fi
   printf '%s;%s\n' "$user2" "$dir2"
 }
 
 resolve_from_dom2(){
-  local user2="$1" dir2="$2"
+  local user2="$1" dir2="$2"; load_mapping
   local user1 dir1
-  load_mapping
-  if [[ -n "${MAP_D2U_TO_D1U[$user2]:-}" ]]; then
-    user1="${MAP_D2U_TO_D1U[$user2]}"
-  else
-    user1="$(map_suffix_to_dom1 "$user2")"
-  fi
-  if [[ -n "${MAP_D2D_TO_D1D[$dir2]:-}" ]]; then
-    dir1="${MAP_D2D_TO_D1D[$dir2]}"
-  else
-    dir1="$user1"
-  fi
+  if [[ -n "${MAP_D2U_TO_D1U[$user2]:-}" ]]; then user1="${MAP_D2U_TO_D1U[$user2]}"; else user1="$(map_suffix_to_dom1 "$user2")"; fi
+  if [[ -n "${MAP_D2D_TO_D1D[$dir2]:-}" ]]; then dir1="${MAP_D2D_TO_D1D[$dir2]}"; else dir1="$user1"; fi
   printf '%s;%s\n' "$user1" "$dir1"
 }
 
-# ------------ Vérifs montages & infos FS ------------
+# ------------ Montages ------------
 ensure_mount() {
   local p="$1"
   if ! mountpoint -q "$p"; then
     log WARN "Montage absent: $p -> tentative mount"
-    if ! mount "$p" >>"$LOG" 2>&1; then
-      log ERROR "Échec du montage: $p"
-      return 1
-    fi
+    if ! mount "$p" >>"$LOG" 2>&1; then log ERROR "Échec du montage: $p"; return 1; fi
   fi
-  local dev opts
-  dev="$(findmnt -n -o SOURCE --target "$p" || true)"
-  opts="$(findmnt -n -o OPTIONS --target "$p" || true)"
-  local df_line
-  df_line="$(df -hP "$p" | awk 'NR==2{print "size="$2,"used="$3,"avail="$4,"use%="$5}')"
+  local dev="$(findmnt -n -o SOURCE --target "$p" || true)"
+  local opts="$(findmnt -n -o OPTIONS --target "$p" || true)"
+  local df_line; df_line="$(df -hP "$p" | awk 'NR==2{print "size="$2,"used="$3,"avail="$4,"use%="$5}')"
   log_kv INFO path "$p" device "$dev" options "$opts" $df_line
   return 0
 }
 
-# ------------ Détection de stabilité + transfert + ClamAV ------------
+# ------------ Transfert + ClamAV ------------
 stable_push() {
   local src="$1" dst="$2" direction="$3"
   [[ -d "$src" ]] || { log DEBUG "Source inexistante: $src"; return 0; }
   mkdir -p "$dst" "$QUARANTINE_DIR"
 
   shopt -s nullglob
-  local files=()
-  for f in "$src"/*; do
-    [[ -f "$f" ]] && files+=("$f")
-  done
-
+  local files=(); for f in "$src"/*; do [[ -f "$f" ]] && files+=("$f"); done
   log INFO "Analyse stabilité" "src=$src" "dst=$dst" "candidats=${#files[@]}"
 
-  local stable=()
-  declare -A SHA_CACHE=()
-
+  local stable=(); declare -A SHA_CACHE=()
   for f in "${files[@]}"; do
-    local size1 size2 mtime sha
-    size1=$(stat -c%s "$f" 2>/dev/null || echo -1)
-    mtime=$(stat -c%y "$f" 2>/dev/null || echo "n/a")
-    sleep 2
-    size2=$(stat -c%s "$f" 2>/dev/null || echo -2)
-    if [[ "$size1" -ge 0 && "$size1" -eq "$size2" ]]; then
-      if command -v sha256sum >/dev/null 2>&1; then
-        sha="$(sha256sum -- "$f" | awk '{print $1}')"
-      else
-        sha="sha256:n/a"
-      fi
-      SHA_CACHE["$f"]="$sha"
-      log_kv INFO file "$f" event "QUEUE" size "$size1" mtime "$mtime" sha256 "$sha" dir "$direction"
-      stable+=("$f")
+    local s1=$(stat -c%s "$f" 2>/dev/null || echo -1); local mt=$(stat -c%y "$f" 2>/dev/null || echo "n/a")
+    sleep 2; local s2=$(stat -c%s "$f" 2>/dev/null || echo -2)
+    if [[ "$s1" -ge 0 && "$s1" -eq "$s2" ]]; then
+      local sha; if command -v sha256sum >/dev/null 2>&1; then sha="$(sha256sum -- "$f" | awk '{print $1}')"; else sha="sha256:n/a"; fi
+      SHA_CACHE["$f"]="$sha"; log_kv INFO file "$f" event "QUEUE" size "$s1" mtime "$mt" sha256 "$sha" dir "$direction"; stable+=("$f")
     else
-      log_kv WARN file "$f" event "SKIP_UNSTABLE" size1 "$size1" size2 "$size2" mtime "$mtime" dir "$direction"
+      log_kv WARN file "$f" event "SKIP_UNSTABLE" size1 "$s1" size2 "$s2" mtime "$mt" dir "$direction"
     fi
   done
-
   [[ ${#stable[@]} -gt 0 ]] || { log INFO "Aucun fichier stable à transférer (src=$src)"; return 0; }
 
-  local ok=0 fail=0 infected=0
-  local clam_version
-  clam_version="$($CLAMSCAN_BIN -V 2>/dev/null || echo "clamscan n/a")"
-
+  local ok=0 fail=0 infected=0; local clam_version="$($CLAMSCAN_BIN -V 2>/dev/null || echo "clamscan n/a")"
   local dirdisp="${direction//->/_to_}"
 
   for f in "${stable[@]}"; do
-    local fsize base report_tmp report_name verdict sig scan_rc scan_out sha
-    base="$(basename "$f")"
-    report_name="${base}${REPORT_SUFFIX}"
-    fsize=$(stat -c%s "$f" 2>/dev/null || echo 0)
-    sha="${SHA_CACHE["$f"]:-n/a}"
+    local base="$(basename "$f")"; local fsize=$(stat -c%s "$f" 2>/dev/null || echo 0); local sha="${SHA_CACHE["$f"]:-n/a}"
+    local report_tmp report_name verdict sig scan_rc scan_out; report_name="${base}${REPORT_SUFFIX}"
 
-    # --- Scan ClamAV ---
     if [[ -x "$CLAMSCAN_BIN" ]]; then
-      if scan_out="$("$CLAMSCAN_BIN" --no-summary --stdout -- "$f" 2>&1)"; then
-        scan_rc=0
-      else
-        scan_rc=$?
-      fi
-      if (( scan_rc == 0 )); then
-        verdict="CLEAN"; sig=""
-      elif (( scan_rc == 1 )); then
-        verdict="INFECTED"
-        sig="$(awk -F': ' '/ FOUND$/{sub(/ FOUND$/,"",$2);print $2}' <<<"$scan_out" | head -1)"
-        ((infected++))
-      else
-        verdict="ERROR"; sig="Scan error"; ((infected++))
-      fi
-    else
-      verdict="UNKNOWN"; sig="clamscan missing"; ((infected++))
-      log ERROR "clamscan/clamdscan introuvable — fichier BLOQUÉ"
-    fi
+      if scan_out="$("$CLAMSCAN_BIN" --no-summary --stdout -- "$f" 2>&1)"; then scan_rc=0; else scan_rc=$?; fi
+      if   (( scan_rc == 0 )); then verdict="CLEAN"; sig=""
+      elif (( scan_rc == 1 )); then verdict="INFECTED"; sig="$(awk -F': ' '/ FOUND$/{sub(/ FOUND$/,"",$2);print $2}' <<<"$scan_out" | head -1)"; ((infected++))
+      else verdict="ERROR"; sig="Scan error"; ((infected++)); fi
+    else verdict="UNKNOWN"; sig="clamscan missing"; ((infected++)); log ERROR "Scanner introuvable"; fi
 
-    # --- Rapport user-friendly ---
     report_tmp="$(mktemp)"
     {
       echo "=== FTBridge / Rapport ClamAV ==="
@@ -422,22 +304,18 @@ stable_push() {
       echo "================================="
     } >"$report_tmp"
 
-    # --- Action selon verdict ---
     if [[ "$verdict" == "CLEAN" ]]; then
       if rsync -t --partial --partial-dir="$RSYNC_PARTIAL_DIR" --remove-source-files \
                --info=ALL2,FLIST2,PROGRESS2 --itemize-changes --human-readable \
                -- "$f" "$dst/" >>"$LOG" 2>&1; then
-        log_kv INFO event "XFER" dir "$direction" path "$f" to "$dst/" size "$fsize"
-        ((ok++))
+        log_kv INFO event "XFER" dir "$direction" path "$f" to "$dst/" size "$fsize"; ((ok++))
       else
-        log_kv ERROR event "XFER_FAIL" dir "$direction" path "$f"
-        ((fail++))
+        log_kv ERROR event "XFER_FAIL" dir "$direction" path "$f"; ((fail++))
       fi
       rsync -t --info=NAME -- "$report_tmp" "$dst/$report_name" >>"$LOG" 2>&1 || true
       rm -f -- "$report_tmp" || true
     else
-      local qdir="$QUARANTINE_DIR/$(date +%F)/$dirdisp"
-      mkdir -p "$qdir"
+      local qdir="$QUARANTINE_DIR/$(date +%F)/$dirdisp"; mkdir -p "$qdir"
       local qpath="$qdir/$base"
       if mv -f -- "$f" "$qpath"; then
         log_kv WARN event "QUARANTINE" dir "$direction" src "$f" qpath "$qpath" verdict "$verdict" details "$sig"
@@ -450,62 +328,45 @@ stable_push() {
   done
 
   log_kv INFO event "RSYNC_SUMMARY" dir "$direction" ok "$ok" infected_blocked "$infected" failed "$fail"
-
-  # Nettoyage
   find "$src" -mindepth 1 -type d -name "$RSYNC_PARTIAL_DIR" -empty -delete 2>/dev/null || true
   find "$src" -mindepth 1 -type d -empty -delete 2>/dev/null || true
-
   return 0
 }
 
-# ------------ Boucle principale ------------
+# ------------ Main ------------
 main() {
   exec 9>"$LOCK" || exit 0
-  if ! flock -n 9; then
-    log WARN "Exécution déjà en cours, abandon du cycle."
-    exit 0
-  fi
+  if ! flock -n 9; then log WARN "Exécution déjà en cours, abandon du cycle."; exit 0; fi
 
-  local start_ts end_ts
-  start_ts=$(date +%s)
-
+  local start_ts end_ts; start_ts=$(date +%s)
   log INFO "=== CYCLE DEBUT ==="
-  log_kv INFO kernel "$(uname -r)" hostname "$(hostname -f 2>/dev/null || hostname)" \
-                 user "$(id -un)" pid "$$" sh "$(bash --version | head -1)"
+  log_kv INFO kernel "$(uname -r)" hostname "$(hostname -f 2>/dev/null || hostname)" user "$(id -un)" pid "$$" sh "$(bash --version | head -1)"
 
   ensure_mount "$DOM1" || exit 0
   ensure_mount "$DOM2" || exit 0
 
   # DOM1 -> DOM2 (IN -> OUT)
   while IFS= read -r -d '' uroot; do
-    local u dir_from u2 dir_to_name dst
-    u="$(basename "$uroot")"
-    dir_from="$uroot/IN"
-    [[ -d "$dir_from" ]] || { log_kv DEBUG event "NO_IN" user "$u" base "$uroot"; continue; }
-    IFS=';' read -r u2 dir_to_name < <(resolve_from_dom1 "$u" "$u")
-    dst="$DOM2/$dir_to_name/OUT"
+    local u; u="$(basename "$uroot")"
+    local dir_from="$uroot/IN"; [[ -d "$dir_from" ]] || { log_kv DEBUG event "NO_IN" user "$u" base "$uroot"; continue; }
+    local u2 dir_to; IFS=';' read -r u2 dir_to < <(resolve_from_dom1 "$u" "$u")
+    local dst="$DOM2/$dir_to/OUT"
     log_kv INFO event "FLOW" dir "DOM1->DOM2" user_src "$u" user_dst "$u2" from "$dir_from" to "$dst"
-    mkdir -p "$dst"
-    stable_push "$dir_from" "$dst" "DOM1->DOM2" || true
+    mkdir -p "$dst"; stable_push "$dir_from" "$dst" "DOM1->DOM2" || true
   done < <(find "$DOM1" -mindepth 1 -maxdepth 1 -type d -print0)
 
   # DOM2 -> DOM1 (IN -> OUT)
   while IFS= read -r -d '' vroot; do
-    local v dir_from v2 dir_to_name dst
-    v="$(basename "$vroot")"
-    dir_from="$vroot/IN"
-    [[ -d "$dir_from" ]] || { log_kv DEBUG event "NO_IN" user "$v" base "$vroot"; continue; }
-    IFS=';' read -r v2 dir_to_name < <(resolve_from_dom2 "$v" "$v")
-    dst="$DOM1/$dir_to_name/OUT"
+    local v; v="$(basename "$vroot")"
+    local dir_from="$vroot/IN"; [[ -d "$dir_from" ]] || { log_kv DEBUG event "NO_IN" user "$v" base "$vroot"; continue; }
+    local v2 dir_to; IFS=';' read -r v2 dir_to < <(resolve_from_dom2 "$v" "$v")
+    local dst="$DOM1/$dir_to/OUT"
     log_kv INFO event "FLOW" dir "DOM2->DOM1" user_src "$v" user_dst "$v2" from "$dir_from" to "$dst"
-    mkdir -p "$dst"
-    stable_push "$dir_from" "$dst" "DOM2->DOM1" || true
+    mkdir -p "$dst"; stable_push "$dir_from" "$dst" "DOM2->DOM1" || true
   done < <(find "$DOM2" -mindepth 1 -maxdepth 1 -type d -print0)
 
-  end_ts=$(date +%s)
-  local dur=$(( end_ts - start_ts ))
-  log_kv INFO event "CYCLE_END" duration_s "$dur"
-  log INFO "=== CYCLE FIN (${dur}s) ==="
+  end_ts=$(date +%s); local dur=$(( end_ts - start_ts ))
+  log_kv INFO event "CYCLE_END" duration_s "$dur"; log INFO "=== CYCLE FIN (${dur}s) ==="
 }
 
 main
@@ -538,7 +399,7 @@ install_systemd_timer() {
 
   cat >/etc/systemd/system/$SERVICE_NAME <<EOF
 [Unit]
-Description=FTBridge sync bi-directionnelle (IN->OUT) DOM1<->DOM2 (+ ClamAV + quarantaine + mapping)
+Description=FTBridge sync bi-directionnelle (IN->OUT) DOM1<->DOM2 (+ ClamAV + mapping)
 After=network-online.target remote-fs.target
 Wants=network-online.target
 RequiresMountsFor=$MNT1 $MNT2
@@ -590,7 +451,7 @@ install_logrotate
 install_systemd_timer
 
 say "=== OK ===
-- Mapping : $MAP_FILE (rechargé automatiquement à chaque changement)
+- Mapping : $MAP_FILE (à remplir via add_mapping.sh)
 - Script  : $SYNC_BIN
 - Montages: $MNT1 et $MNT2 (SMB 3.1.1 + seal, noexec/nosuid/nodev)
 - Logs    : $LOGFILE (rotation quotidienne + taille)
