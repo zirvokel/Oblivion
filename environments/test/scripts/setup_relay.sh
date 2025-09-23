@@ -30,11 +30,7 @@ NFT_CONF="/etc/nftables.d/99-ftbridge-drop-forward.nft"
 # ==================== Fonctions utilitaires ====================
 say(){ echo -e "$*"; }
 need_root(){ [[ $EUID -eq 0 ]] || { echo "Exécuter en root"; exit 1; }; }
-prompt_secret(){
-  local prompt="$1" var
-  read -r -s -p "$prompt : " var; echo
-  printf "%s" "$var"
-}
+prompt_secret(){ local prompt="$1" var; read -r -s -p "$prompt : " var; echo; printf "%s" "$var"; }
 
 pick_ifaces() {
   local i1="${IFACE_DOM1:-}" i2="${IFACE_DOM2:-}"
@@ -137,7 +133,6 @@ install_ftbridge_sync() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ------------ Chemins ------------
 LOG="/var/log/ftbridge/sync.log"
 DOM1="/mnt/dom1_transactions"
 DOM2="/mnt/dom2_transactions"
@@ -147,19 +142,17 @@ QUARANTINE_DIR="/var/quarantine/ftbridge"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"   # DEBUG|INFO|WARN|ERROR
 RSYNC_PARTIAL_DIR=".rsync-partial"
 
-# ClamAV
 CLAMSCAN_BIN="${CLAMSCAN_BIN:-/usr/bin/clamscan}"
 REPORT_SUFFIX="_clamav"
 
-# ------------ Logging ------------
 _lvl_num(){ case "${1^^}" in DEBUG) echo 10;; INFO) echo 20;; WARN) echo 30;; ERROR) echo 40;; *) echo 20;; esac; }
 _should_log(){ [[ $(_lvl_num "$1") -ge $(_lvl_num "$LOG_LEVEL") ]]; }
 log(){ local lvl="${1:-INFO}"; shift || true; _should_log "$lvl" || return 0; printf "[%(%F %T)T] %-5s pid=%s %s\n" -1 "${lvl^^}" "$$" "$*" >>"$LOG"; }
 log_kv(){ local lvl="${1:-INFO}"; shift; _should_log "$lvl" || return 0; printf "[%(%F %T)T] %-5s pid=%s " -1 "${lvl^^}" "$$" >>"$LOG"; printf "%s=%q " "$@" >>"$LOG"; printf "\n" >>"$LOG"; }
 trap 'rc=$?; log ERROR "erreur inattendue (rc=$rc) à la ligne $LINENO"' ERR
 
-# ------------ Mapping (CSV sans suffixes) ------------
-# Format: sam_dom1,sam_dom2 (sans .dmz / .adm)
+# ------------ Mapping (CSV) ------------
+# En-tête attendu: dom1_user,dom2_user,dom1_dir,dom2_dir
 declare -A MAP_D1_TO_D2
 declare -A MAP_D2_TO_D1
 MAP_MTIME=0
@@ -168,14 +161,19 @@ load_map(){
   local mtime
   mtime=$(stat -c %Y "$MAP_FILE" 2>/dev/null || echo 0)
   [[ "$mtime" -eq "$MAP_MTIME" ]] && return 0
-  MAP_D1_TO_D2=()
-  MAP_D2_TO_D1=()
+  MAP_D1_TO_D2=(); MAP_D2_TO_D1=()
   while IFS=, read -r d1 d2 d1dir d2dir; do
-    [[ -z "${d1// }" || -z "${d2// }" ]] && continue
-    [[ "$d1" =~ ^# ]] && continue
-    # On refuse les suffixes dans la MAP
+    [[ -z "${d1// }" || "${d1:0:1}" == "#" ]] && continue
+    # Ignore l'en-tête s'il est présent (case-insensitive)
+    shopt -s nocasematch
+    if [[ "$d1" == "dom1_user" && "$d2" == "dom2_user" ]]; then shopt -u nocasematch; continue; fi
+    shopt -u nocasematch
+    # Normalisation (refuse suffixes dans la map)
     d1="${d1%%.dmz}"; d1="${d1%%.adm}"
     d2="${d2%%.dmz}"; d2="${d2%%.adm}"
+    d1="${d1#"${d1%%[![:space:]]*}"}"; d1="${d1%"${d1##*[![:space:]]}"}"
+    d2="${d2#"${d2%%[![:space:]]*}"}"; d2="${d2%"${d2##*[![:space:]]}"}"
+    [[ -z "$d1" || -z "$d2" ]] && continue
     MAP_D1_TO_D2["$d1"]="$d2"
     MAP_D2_TO_D1["$d2"]="$d1"
   done < "$MAP_FILE"
@@ -184,40 +182,25 @@ load_map(){
   log_kv INFO event "MAP_RELOADED" file "$MAP_FILE" mtime "$mtime" pairs "$count"
 }
 
-# Normalisation noms dossier (ajoute suffixe attendu côté FS)
-to_dom1_fs(){ # entrée: sam sans suffixe -> sortie: sam.dmz
-  local u="$1"
-  [[ "$u" == *".dmz" ]] && { echo "$u"; return; }
-  [[ "$u" == *".adm" ]] && { echo "${u%.adm}.dmz"; return; }
-  echo "${u}.dmz"
-}
-to_dom2_fs(){ # entrée: sam sans suffixe -> sortie: sam.adm
-  local u="$1"
-  [[ "$u" == *".adm" ]] && { echo "$u"; return; }
-  [[ "$u" == *".dmz" ]] && { echo "${u%.dmz}.adm"; return; }
-  echo "${u}.adm"
-}
+to_dom1_fs(){ local u="$1"; [[ "$u" == *".dmz" ]] && { echo "$u"; return; }; [[ "$u" == *".adm" ]] && { echo "${u%.adm}.dmz"; return; }; echo "${u}.dmz"; }
+to_dom2_fs(){ local u="$1"; [[ "$u" == *".adm" ]] && { echo "$u"; return; }; [[ "$u" == *".dmz" ]] && { echo "${u%.dmz}.adm"; return; }; echo "${u}.adm"; }
 
-# ------------ Vérifs montages & infos FS ------------
 ensure_mount() {
   local p="$1"
   if ! mountpoint -q "$p"; then
     log WARN "Montage absent: $p -> tentative mount"
     if ! mount "$p" >>"$LOG" 2>&1; then
-      log ERROR "Échec du montage: $p"
-      return 1
+      log ERROR "Échec du montage: $p"; return 1
     fi
   fi
-  local dev opts
+  local dev opts df_line
   dev="$(findmnt -n -o SOURCE --target "$p" || true)"
   opts="$(findmnt -n -o OPTIONS --target "$p" || true)"
-  local df_line
   df_line="$(df -hP "$p" | awk 'NR==2{print "size="$2,"used="$3,"avail="$4,"use_pct="$5}')"
   log_kv INFO path "$p" device "$dev" options "$opts" $df_line
   return 0
 }
 
-# ------------ Transfert avec détection de stabilité + ClamAV ------------
 stable_push() {
   local src="$1" dst="$2" direction="$3"
   [[ -d "$src" ]] || { log DEBUG "Source inexistante: $src"; return 0; }
@@ -237,11 +220,7 @@ stable_push() {
     sleep 2
     s2=$(stat -c%s "$f" 2>/dev/null || echo -2)
     if [[ "$s1" -ge 0 && "$s1" -eq "$s2" ]]; then
-      if command -v sha256sum >/dev/null 2>&1; then
-        sha="$(sha256sum -- "$f" | awk '{print $1}')"
-      else
-        sha="sha256:n/a"
-      fi
+      if command -v sha256sum >/dev/null 2>&1; then sha="$(sha256sum -- "$f" | awk '{print $1}')"; else sha="sha256:n/a"; fi
       log_kv INFO file "$f" event "QUEUE" size "$s1" mtime "$mt" sha256 "$sha" dir "$direction"
       stable+=("$f")
     else
@@ -261,28 +240,16 @@ stable_push() {
     report_name="${base}${REPORT_SUFFIX}"
     fsize=$(stat -c%s "$f" 2>/dev/null || echo 0)
 
-    # --- Scan ClamAV ---
     if [[ -x "$CLAMSCAN_BIN" ]]; then
-      if scan_out="$("$CLAMSCAN_BIN" --no-summary --stdout -- "$f" 2>&1)"; then
-        scan_rc=0
-      else
-        scan_rc=$?
-      fi
-      if (( scan_rc == 0 )); then
-        verdict="CLEAN"; sig=""
-      elif (( scan_rc == 1 )); then
-        verdict="INFECTED"
-        sig="$(awk -F': ' '/ FOUND$/{sub(/ FOUND$/,"",$2);print $2}' <<<"$scan_out" | head -1)"
-        ((infected++))
-      else
-        verdict="ERROR"; sig="Scan error"; ((infected++))
+      if scan_out="$("$CLAMSCAN_BIN" --no-summary --stdout -- "$f" 2>&1)"; then scan_rc=0; else scan_rc=$?; fi
+      if   (( scan_rc == 0 )); then verdict="CLEAN";   sig=""
+      elif (( scan_rc == 1 )); then verdict="INFECTED"; sig="$(awk -F': ' '/ FOUND$/{sub(/ FOUND$/,"",$2);print $2}' <<<"$scan_out" | head -1)"; ((infected++))
+      else                        verdict="ERROR";    sig="Scan error"; ((infected++))
       fi
     else
-      verdict="UNKNOWN"; sig="clamscan missing"; ((infected++))
-      log ERROR "clamscan introuvable — fichier BLOQUÉ"
+      verdict="UNKNOWN"; sig="clamscan missing"; ((infected++)); log ERROR "clamscan introuvable — fichier BLOQUÉ"
     fi
 
-    # --- Rapport lisible ---
     report_tmp="$(mktemp)"
     {
       echo "=== FTBridge / Rapport ClamAV ==="
@@ -306,22 +273,18 @@ stable_push() {
       echo "================================="
     } >"$report_tmp"
 
-    # --- Action ---
     if [[ "$verdict" == "CLEAN" ]]; then
       if rsync -t --partial --partial-dir="$RSYNC_PARTIAL_DIR" --remove-source-files \
                --info=ALL2,FLIST2,PROGRESS2 --itemize-changes --human-readable \
                -- "$f" "$dst/" >>"$LOG" 2>&1; then
-        log_kv INFO event "XFER" dir "$direction" path "$f" to "$dst/" size "$fsize"
-        ((ok++))
+        log_kv INFO event "XFER" dir "$direction" path "$f" to "$dst/" size "$fsize"; ((ok++))
       else
-        log_kv ERROR event "XFER_FAIL" dir "$direction" path "$f"
-        ((fail++))
+        log_kv ERROR event "XFER_FAIL" dir "$direction" path "$f"; ((fail++))
       fi
       rsync -t --info=NAME -- "$report_tmp" "$dst/$report_name" >>"$LOG" 2>&1 || true
       rm -f -- "$report_tmp" || true
     else
-      local qdir="$QUARANTINE_DIR/$(date +%F)/$dirdisp"
-      mkdir -p "$qdir"
+      local qdir="$QUARANTINE_DIR/$(date +%F)/$dirdisp"; mkdir -p "$qdir"
       local qpath="$qdir/$base"
       if mv -f -- "$f" "$qpath"; then
         log_kv WARN event "QUARANTINE" dir "$direction" src "$f" qpath "$qpath" verdict "$verdict" details "$sig"
@@ -337,16 +300,11 @@ stable_push() {
   find "$src" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 }
 
-# ------------ Boucle principale ------------
 main() {
   exec 9>"$LOCK" || exit 0
-  if ! flock -n 9; then
-    log WARN "Exécution déjà en cours, abandon du cycle."
-    exit 0
-  fi
+  if ! flock -n 9; then log WARN "Exécution déjà en cours, abandon du cycle."; exit 0; fi
 
-  local start_ts end_ts
-  start_ts=$(date +%s)
+  local start_ts end_ts; start_ts=$(date +%s)
   log INFO "=== CYCLE DEBUT ==="
   log_kv INFO kernel "$(uname -r)" hostname "$(hostname -f 2>/dev/null || hostname)" user "$(id -un)" pid "$$" sh "$(bash --version | head -1)"
 
@@ -356,38 +314,35 @@ main() {
 
   # DOM1 -> DOM2
   while IFS= read -r -d '' uroot; do
-    u="$(basename "$uroot")"                    # ex: j.doe-admin.dmz
-    usans="${u%%.dmz}"; usans="${usans%%.adm}" # ex: j.doe-admin
+    u="$(basename "$uroot")"
+    usans="${u%%.dmz}"; usans="${usans%%.adm}"
     v="${MAP_D1_TO_D2[$usans]:-}"
     if [[ -z "$v" ]]; then
       log_kv WARN event "NO_MAPPING" dir "DOM1->DOM2" user_src "$u" hint "ajoutez une ligne à $MAP_FILE"
       continue
     fi
-    vfs="$(to_dom2_fs "$v")"                    # ex: john.doe.adm
-    src="$uroot/IN"; dst="$DOM2/$vfs/OUT"
-    mkdir -p "$dst"
+    vfs="$(to_dom2_fs "$v")"
+    src="$uroot/IN"; dst="$DOM2/$vfs/OUT"; mkdir -p "$dst"
     log_kv INFO event "FLOW" dir "DOM1->DOM2" user_src "$u" user_dst "$v" from "$src" to "$dst"
     stable_push "$src" "$dst" "DOM1->DOM2" || true
   done < <(find "$DOM1" -mindepth 1 -maxdepth 1 -type d -print0)
 
   # DOM2 -> DOM1
   while IFS= read -r -d '' vroot; do
-    v="$(basename "$vroot")"                    # ex: john.doe.adm
-    vsans="${v%%.adm}"; vsans="${vsans%%.dmz}" # ex: john.doe
+    v="$(basename "$vroot")"
+    vsans="${v%%.adm}"; vsans="${vsans%%.dmz}"
     u="${MAP_D2_TO_D1[$vsans]:-}"
     if [[ -z "$u" ]]; then
       log_kv WARN event "NO_MAPPING" dir "DOM2->DOM1" user_src "$v" hint "ajoutez une ligne à $MAP_FILE"
       continue
     fi
-    ufs="$(to_dom1_fs "$u")"                    # ex: j.doe-admin.dmz
-    src="$vroot/IN"; dst="$DOM1/$ufs/OUT"
-    mkdir -p "$dst"
+    ufs="$(to_dom1_fs "$u")"
+    src="$vroot/IN"; dst="$DOM1/$ufs/OUT"; mkdir -p "$dst"
     log_kv INFO event "FLOW" dir "DOM2->DOM1" user_src "$v" user_dst "$u" from "$src" to "$dst"
     stable_push "$src" "$dst" "DOM2->DOM1" || true
   done < <(find "$DOM2" -mindepth 1 -maxdepth 1 -type d -print0)
 
-  end_ts=$(date +%s)
-  local dur=$(( end_ts - start_ts ))
+  end_ts=$(date +%s); local dur=$(( end_ts - start_ts ))
   log_kv INFO event "CYCLE_END" duration_s "$dur"
   log INFO "=== CYCLE FIN (${dur}s) ==="
 }
@@ -398,65 +353,82 @@ EOF
 }
 
 install_add_mapping() {
-  cat >/usr/local/sbin/add_mapping.sh <<'EOF'
+  # Version cohérente avec le format à 4 colonnes + en-tête
+  cat >/usr/local/sbin/add_mapping <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+exec /usr/bin/env bash -c '
 MAP="/etc/ftbridge/map.csv"
+d1=""; d2=""; d1d=""; d2d=""; FORCE=0
 
-usage(){
-  cat <<USAGE
+usage(){ cat <<USAGE
 Usage:
-  add_mapping.sh --dom1-user SAM_DOM1 --dom2-user SAM_DOM2
-Notes:
-  - Ne PAS mettre de suffixes (.dmz/.adm). Le script les gère automatiquement.
-  - La table de correspondance: $MAP
+  add_mapping --dom1-user <u1> --dom2-user <u2> [--dom1-dir <d1>] [--dom2-dir <d2>] [--force]
 USAGE
 }
 
-d1=""; d2=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dom1-user) d1="$2"; shift 2;;
     --dom2-user) d2="$2"; shift 2;;
-    -h|--help) usage; exit 0;;
+    --dom1-dir)  d1d="$2"; shift 2;;
+    --dom2-dir)  d2d="$2"; shift 2;;
+    --force)     FORCE=1; shift;;
+    -h|--help)   usage; exit 0;;
     *) echo "Argument inconnu: $1"; usage; exit 1;;
   esac
 done
 
-[[ -z "$d1" || -z "$d2" ]] && { usage; exit 1; }
+[[ -n "$d1" && -n "$d2" ]] || { usage; exit 1; }
 
-# Refuse suffixes ici (la table ne doit PAS en contenir)
-for x in "$d1" "$d2"; do
-  if [[ "$x" == *".dmz" || "$x" == *".adm" ]]; then
-    echo "Ne pas inclure de suffixe dans la table (reçu: $x)"; exit 1;
-  fi
-done
+strip(){ sed -E "s/\.(dmz|adm)$//I"; }
+d1="$(printf "%s" "$d1" | xargs | strip)"
+d2="$(printf "%s" "$d2" | xargs | strip)"
+[[ -n "$d1d" ]] || d1d="$d1"
+[[ -n "$d2d" ]] || d2d="$d2"
 
 mkdir -p "$(dirname "$MAP")"
-touch "$MAP"
+touch "$MAP"; chmod 640 "$MAP"
 
-# Évite doublons (sur même ligne ou inversé)
-if grep -i -qE "^${d1},${d2}$" "$MAP"; then
-  echo "Mapping déjà présent: $d1,$d2"
-  exit 0
-fi
-if grep -i -qE "^${d2},${d1}$" "$MAP"; then
-  echo "Attention: une ligne inversée existe (${d2},${d1}). Corrigez si besoin."
+exec 9<>"$MAP"; flock 9
+
+if [[ ! -s "$MAP" || "$(head -n1 "$MAP")" != "dom1_user,dom2_user,dom1_dir,dom2_dir" ]]; then
+  tmp="$(mktemp)"
+  { echo "dom1_user,dom2_user,dom1_dir,dom2_dir"; awk "NR>1 && \$0!~/^\\s*(#|$)/{print}" "$MAP" 2>/dev/null || true; } >"$tmp"
+  cat "$tmp" >"$MAP"; rm -f "$tmp"
 fi
 
-echo "${d1},${d2}" >> "$MAP"
-echo "OK: ajouté ${d1},${d2} -> $MAP"
+existing="$(awk -F, -v u1="$d1" -v u2="$d2" "BEGIN{IGNORECASE=1} NR>1 && tolower(\$1)==tolower(u1) && tolower(\$2)==tolower(u2){print; exit}" "$MAP" || true)"
+
+if [[ -n "$existing" ]]; then
+  IFS=, read -r e1 e2 e3 e4 <<<"$existing"
+  if [[ "$e3" == "$d1d" && "$e4" == "$d2d" ]]; then
+    echo "Mapping déjà présent: $existing"; exit 0
+  else
+    if (( FORCE )); then
+      tmp="$(mktemp)"
+      awk -F, -v OFS=, -v u1="$d1" -v u2="$d2" -v nd1="$d1d" -v nd2="$d2d" "BEGIN{IGNORECASE=1} NR==1{print; next} (tolower(\$1)==tolower(u1)&&tolower(\$2)==tolower(u2)){print \$1,\$2,nd1,nd2; next} {print}" "$MAP" >"$tmp"
+      cat "$tmp" >"$MAP"; rm -f "$tmp"
+      echo "Mapping mis à jour: $d1,$d2,$d1d,$d2d"; exit 0
+    else
+      echo "Différent: existant=$existing, nouveau=$d1,$d2,$d1d,$d2d (utilisez --force)"; exit 2
+    fi
+  fi
+else
+  echo "$d1,$d2,$d1d,$d2d" >>"$MAP"
+  echo "OK: ajouté $d1,$d2,$d1d,$d2d -> $MAP"
+fi
+'
 EOF
-  chmod +x /usr/local/sbin/add_mapping.sh
+  chmod +x /usr/local/sbin/add_mapping
 
-  # Fichier map si absent
+  # Fichier map si absent (avec en-tête)
   if [[ ! -f "$MAP_FILE" ]]; then
     mkdir -p "$MAP_DIR"
     cat >"$MAP_FILE" <<'EOF'
-# Table de correspondance FTBridge (ne pas mettre .dmz/.adm)
-# Format: sam_dom1,sam_dom2
+dom1_user,dom2_user,dom1_dir,dom2_dir
 # Exemple:
-# j.doe-admin,john.doe
+# j.doe-admin,john.doe,j.doe-admin,john.doe
 EOF
     chmod 640 "$MAP_FILE"
   fi
@@ -533,8 +505,8 @@ install_logrotate
 install_systemd_timer
 
 say "=== OK ===
-- Mapping : $MAP_FILE (à remplir via add_mapping.sh)
-- Script  : /usr/local/sbin/ftbridge_sync.sh (créé par ce setup)
+- Mapping : $MAP_FILE (à remplir via add_mapping)
+- Script  : /usr/local/sbin/ftbridge_sync.sh
 - Montages: $MNT1 et $MNT2 (SMB 3.1.1 + seal, noexec/nosuid/nodev)
 - Logs    : $LOGFILE (rotation quotidienne + taille)
 - Service : $SERVICE_NAME + $TIMER_NAME (~10s)
