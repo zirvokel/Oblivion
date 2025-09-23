@@ -26,6 +26,7 @@ if ([string]::IsNullOrWhiteSpace($FirstName) -or
   exit 1
 }
 
+# SAM réel avec suffixe (répertoires FS créés de cette forme)
 $Sam = "$SamBase$Suffix"
 $UPN = "$Sam@$($ad.DNSRoot)"
 
@@ -98,6 +99,7 @@ function Ensure-Ownership {
   $null = Invoke-Cmd -CommandLine "icacls $pQuoted /setowner `"*S-1-5-32-544`" /T /C"
 }
 
+# SIDs utiles (OK sur OS FR)
 $SID_CREATOR_OWNER = "*S-1-3-0"
 $SID_SYSTEM        = "*S-1-5-18"
 $SID_BUILTIN_USERS = "*S-1-5-32-545"
