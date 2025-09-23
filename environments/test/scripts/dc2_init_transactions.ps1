@@ -9,18 +9,34 @@ $shareName= 'Transactions'
 $group    = 'DMZ_2_ADM'
 $svc      = 'svc_relay_dom2'
 
+# SIDs (indépendants de la langue)
 $SID_SYSTEM = 'S-1-5-18'
 $SID_DA     = ($domain.DomainSID.Value.Trim()) + '-512' # Domain Admins
 
 Write-Host "Domaine: $($domain.DNSRoot) ($netbios)"
 
-# OUs
-if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Groupes du domaine'")) { New-ADOrganizationalUnit -Name 'Groupes du domaine' -Path $domainDN | Out-Null; Write-Host "OU Créée: Groupes du domaine" } else { Write-Host "OU Ok: Groupes du domaine" }
-if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Utilisateurs du domaine'")) { New-ADOrganizationalUnit -Name 'Utilisateurs du domaine' -Path $domainDN | Out-Null; Write-Host "OU Créée: Utilisateurs du domaine" } else { Write-Host "OU Ok: Utilisateurs du domaine" }
-if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Comptes de service'")) { New-ADOrganizationalUnit -Name 'Comptes de service' -Path $domainDN | Out-Null; Write-Host "OU Créée: Comptes de service" } else { Write-Host "OU Ok: Comptes de service" }
+# OUs (création à la racine du domaine)
+if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Groupes du domaine'")) {
+    New-ADOrganizationalUnit -Name 'Groupes du domaine' -Path $domainDN | Out-Null
+    Write-Host "OU Créée: Groupes du domaine"
+} else { Write-Host "OU Ok: Groupes du domaine" }
+
+if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Utilisateurs du domaine'")) {
+    New-ADOrganizationalUnit -Name 'Utilisateurs du domaine' -Path $domainDN | Out-Null
+    Write-Host "OU Créée: Utilisateurs du domaine"
+} else { Write-Host "OU Ok: Utilisateurs du domaine" }
+
+if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Comptes de service'")) {
+    New-ADOrganizationalUnit -Name 'Comptes de service' -Path $domainDN | Out-Null
+    Write-Host "OU Créée: Comptes de service"
+} else { Write-Host "OU Ok: Comptes de service" }
 
 # Groupe & compte service
-if (-not (Get-ADGroup -Filter "SamAccountName -eq '$group'")) { New-ADGroup -Name $group -SamAccountName $group -GroupCategory Security -GroupScope Global -Path "OU=Groupes du domaine,$domainDN" | Out-Null; Write-Host "Groupe créé: $group" } else { Write-Host "Groupe OK: $group" }
+if (-not (Get-ADGroup -Filter "SamAccountName -eq '$group'")) {
+  New-ADGroup -Name $group -SamAccountName $group -GroupCategory Security -GroupScope Global -Path "OU=Groupes du domaine,$domainDN" | Out-Null
+  Write-Host "Groupe créé: $group"
+} else { Write-Host "Groupe OK: $group" }
+
 if (-not (Get-ADUser -Filter "SamAccountName -eq '$svc'")) {
   $password = Read-Host -AsSecureString "Mot de passe pour $svc"
   New-ADUser -Name $svc -SamAccountName $svc -Enabled $true -AccountPassword $password `
@@ -42,14 +58,16 @@ if (-not (Get-SmbShare -Name $shareName -ErrorAction SilentlyContinue)) {
   Write-Host "Partage créé: \\$env:COMPUTERNAME\$shareName"
 } else { Write-Host "Partage OK: \\$env:COMPUTERNAME\$shareName" }
 
-# ACLs NTFS
-$aceAdmins = "*$SID_DA:(OI)(CI)(F)"
+# ACL NTFS racine (SIDs pour éviter la localisation)
+$aceAdmins = "*${SID_DA}:(OI)(CI)(F)"
 $aceSvc    = "$netbios\${svc}:(OI)(CI)(M)"
 $aceGroup  = "$netbios\${group}:(RX)"
-icacls $shareRoot /inheritance:d | Out-Null
-icacls $shareRoot /grant:r "*$SID_SYSTEM:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceGroup" | Out-Null
-icacls $shareRoot /remove:g "*S-1-5-32-545" "*S-1-5-11" 2>$null | Out-Null
 
+icacls $shareRoot /inheritance:d | Out-Null
+icacls $shareRoot /grant:r "*${SID_SYSTEM}:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceGroup" | Out-Null
+icacls $shareRoot /remove:g "*S-1-5-32-545" "*S-1-5-11" 2>$null | Out-Null  # Builtin Users / Authenticated Users
+
+# Arborescence par membres humains du groupe
 $members = Get-ADGroupMember -Identity $group -Recursive |
            Where-Object { $_.objectClass -eq 'user' } |
            Get-ADUser -Properties SamAccountName
@@ -64,7 +82,7 @@ foreach ($u in $members) {
 
   $aceUser = "$netbios\${name}:(OI)(CI)(M)"
   icacls $uRoot /inheritance:d | Out-Null
-  icacls $uRoot /grant:r "*$SID_SYSTEM:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceUser" | Out-Null
+  icacls $uRoot /grant:r "*${SID_SYSTEM}:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceUser" | Out-Null
   icacls $uRoot /remove:g "*S-1-5-32-545" "*S-1-5-11" 2>$null | Out-Null
   Write-Host " - $name : IN/OUT + ACL OK"
 }
