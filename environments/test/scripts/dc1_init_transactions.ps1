@@ -59,11 +59,12 @@ if (-not (Get-SmbShare -Name $shareName -ErrorAction SilentlyContinue)) {
 } else { Write-Host "Partage OK: \\$env:COMPUTERNAME\$shareName" }
 
 # ACL NTFS racine (SIDs pour éviter la localisation)
-$aceAdmins = "*$SID_DA:(OI)(CI)(F)"
+$aceAdmins = "*${SID_DA}:(OI)(CI)(F)"
 $aceSvc    = "$netbios\${svc}:(OI)(CI)(M)"
 $aceGroup  = "$netbios\${group}:(RX)"
+
 icacls $shareRoot /inheritance:d | Out-Null
-icacls $shareRoot /grant:r "*$SID_SYSTEM:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceGroup" | Out-Null
+icacls $shareRoot /grant:r "*${SID_SYSTEM}:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceGroup" | Out-Null
 icacls $shareRoot /remove:g "*S-1-5-32-545" "*S-1-5-11" 2>$null | Out-Null  # Builtin Users / Authenticated Users
 
 # Arborescence par membres humains du groupe
@@ -81,7 +82,7 @@ foreach ($u in $members) {
 
   $aceUser = "$netbios\${name}:(OI)(CI)(M)"
   icacls $uRoot /inheritance:d | Out-Null
-  icacls $uRoot /grant:r "*$SID_SYSTEM:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceUser" | Out-Null
+  icacls $uRoot /grant:r "*${SID_SYSTEM}:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceUser" | Out-Null
   icacls $uRoot /remove:g "*S-1-5-32-545" "*S-1-5-11" 2>$null | Out-Null
   Write-Host " - $name : IN/OUT + ACL OK"
 }
