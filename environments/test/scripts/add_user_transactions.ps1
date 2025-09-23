@@ -51,22 +51,15 @@ $GroupPath = Resolve-OU -Preferred $GroupsOU_DN -Fallback $ad.UsersContainer
 
 function Resolve-LocalPath {
   param([Parameter(Mandatory)][string]$SharePath)
-
   $thisNames = @(
     $env:COMPUTERNAME,
     "$($env:COMPUTERNAME).$($ad.DNSRoot)"
   ) + (Get-NetIPAddress -AddressFamily IPv4 | Select-Object -ExpandProperty IPAddress | ForEach-Object { $_.ToString() })
-
   if ($SharePath -match '^\\\\([^\\]+)\\([^\\]+)$') {
-    $TargetHost = $Matches[1]
-    $ShareName  = $Matches[2]
+    $TargetHost = $Matches[1]; $ShareName = $Matches[2]
     if ($thisNames -contains $TargetHost) {
-      try {
-        $smb = Get-SmbShare -Name $ShareName -ErrorAction Stop
-        return $smb.Path
-      } catch {
-        return "C:\$ShareName"
-      }
+      try { (Get-SmbShare -Name $ShareName -ErrorAction Stop).Path } catch { "C:\$ShareName" }
+      return
     }
   }
   return $SharePath
@@ -99,7 +92,7 @@ function Ensure-Ownership {
   $null = Invoke-Cmd -CommandLine "icacls $pQuoted /setowner `"*S-1-5-32-544`" /T /C"
 }
 
-# SIDs utiles (OK sur OS FR)
+# SIDs utiles (indépendants de la langue)
 $SID_CREATOR_OWNER = "*S-1-3-0"
 $SID_SYSTEM        = "*S-1-5-18"
 $SID_BUILTIN_USERS = "*S-1-5-32-545"
@@ -147,7 +140,7 @@ if (-not $user) {
   Write-Host "Utilisateur $Sam existe déjà (aucune création)." -ForegroundColor Yellow
 }
 
-# Ajout au groupe (test explicite d'appartenance)
+# Ajout au groupe
 $inGroup = Get-ADGroupMember -Identity $group.DistinguishedName -Recursive |
            Where-Object { $_.DistinguishedName -eq $user.DistinguishedName }
 if (-not $inGroup) {
@@ -178,7 +171,6 @@ Ensure-Ownership -Path $UserRoot
 $null = Invoke-Icacls ("`"$UserRoot`" /inheritance:r")
 $null = Invoke-Icacls ("`"$UserRoot`" /remove:g `"$(${SID_BUILTIN_USERS})`" `"$(${SID_AUTH_USERS})`"")
 $null = Invoke-Icacls ("`"$UserRoot`" /remove:g `"$(${SID_EVERYONE})`"")
-
 $null = Invoke-Icacls ("`"$UserRoot`" /grant:r `"$(${SID_CREATOR_OWNER}):(OI)(CI)(IO)(F)`"")
 $null = Invoke-Icacls ("`"$UserRoot`" /grant:r `"$(${SID_SYSTEM}):(OI)(CI)(F)`"")
 $null = Invoke-Icacls ("`"$UserRoot`" /grant:r `"$(${SID_DOMAIN_ADMINS}):(OI)(CI)(F)`"")
@@ -207,4 +199,4 @@ Write-Host "   - CREATOR OWNER (SID *S-1-3-0) (IO)(F)"
 Write-Host "   - SYSTEM (SID *S-1-5-18) (F)"
 Write-Host "   - $UserAccount (M)"
 Write-Host "   - $SvcAccount (M)"
-Write-Host "   - Domain Admins ($SID_DOMAIN_ADMINS) (F)"
+Write-Host "   - Domain Admins (*$DomainAdminsSid) (F)"
