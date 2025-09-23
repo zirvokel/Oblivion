@@ -5,11 +5,11 @@ CONF_DIR="/etc/ftbridge"
 MAP_FILE="$CONF_DIR/map.csv"
 
 usage(){
-  cat <<EOF
+  cat <<'EOF'
 Usage:
-  $0 --dom1-user <u1> --dom2-user <u2> [--dom1-dir <d1>] [--dom2-dir <d2>] [--force]
+  add_mapping --dom1-user <u1> --dom2-user <u2> [--dom1-dir <d1>] [--dom2-dir <d2>] [--force]
 
-Ajoute/actualise une ligne dans ${MAP_FILE} :
+Ajoute/actualise une ligne dans /etc/ftbridge/map.csv :
   dom1_user,dom2_user,dom1_dir,dom2_dir
 
 - dom1_user / dom2_user : SAM "logiques" (sans suffixe .dmz/.adm)
@@ -37,6 +37,9 @@ done
 # --------- Vérifs & normalisation ----------
 [[ -n "${D1U}" && -n "${D2U}" ]] || { echo "Erreur: --dom1-user et --dom2-user sont requis."; usage; exit 1; }
 
+# Exiger root plutôt que 'sudo -n true' (peut ne pas exister)
+[[ $EUID -eq 0 ]] || { echo "Ce script nécessite root."; exit 1; }
+
 # Supprime suffixes éventuels (.dmz/.adm) sur les identités logiques
 strip_suf(){ sed -E 's/\.(dmz|adm)$//I'; }
 D1U="$(printf '%s' "$D1U" | tr -d '\r' | xargs | strip_suf)"
@@ -51,15 +54,15 @@ for v in "$D1U" "$D2U" "$D1D" "$D2D"; do
   [[ "$v" != *","* ]] || { echo "Erreur: les valeurs ne doivent pas contenir de virgule: '$v'"; exit 1; }
 done
 
-# Besoin des droits
-sudo -n true 2>/dev/null || { echo "Ce script nécessite sudo/root."; exit 1; }
-
-# --------- Prépare le fichier ----------
+# --------- Prépare le fichier + lock global ----------
 mkdir -p "$CONF_DIR"
 touch "$MAP_FILE"
 chmod 640 "$MAP_FILE"
 
-# Si vide ou en-tête invalide, réécrit proprement l’en-tête en conservant les lignes existantes
+exec 9<>"$MAP_FILE"
+flock 9
+
+# En-tête (si absent/incorrect, on le (ré)écrit en conservant le contenu)
 if [[ ! -s "$MAP_FILE" || "$(head -n1 "$MAP_FILE" || true)" != "dom1_user,dom2_user,dom1_dir,dom2_dir" ]]; then
   tmp="$(mktemp)"
   {
@@ -69,14 +72,10 @@ if [[ ! -s "$MAP_FILE" || "$(head -n1 "$MAP_FILE" || true)" != "dom1_user,dom2_u
   cat "$tmp" >"$MAP_FILE"; rm -f "$tmp"
 fi
 
-# --------- Section critique (lock) ----------
-exec 9<>"$MAP_FILE"
-flock 9
-
 # Recherche case-insensitive sur les 2 premières colonnes (identités logiques)
 existing="$(awk -F',' -v u1="$D1U" -v u2="$D2U" '
   BEGIN{IGNORECASE=1}
-  NR>1 && $1==u1 && $2==u2 {print $0}
+  NR>1 && tolower($1)==tolower(u1) && tolower($2)==tolower(u2) {print $0; exit}
 ' "$MAP_FILE" || true)"
 
 if [[ -n "$existing" ]]; then
@@ -91,7 +90,7 @@ if [[ -n "$existing" ]]; then
       awk -F',' -v OFS=',' -v u1="$D1U" -v u2="$D2U" -v nd1="$D1D" -v nd2="$D2D" '
         BEGIN{IGNORECASE=1}
         NR==1 {print; next}
-        ($1==u1 && $2==u2) {print $1,$2,nd1,nd2; next}
+        (tolower($1)==tolower(u1) && tolower($2)==tolower(u2)) {print $1,$2,nd1,nd2; next}
         {print}
       ' "$MAP_FILE" >"$tmp"
       cat "$tmp" >"$MAP_FILE"; rm -f "$tmp"
