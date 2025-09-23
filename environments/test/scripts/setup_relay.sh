@@ -72,11 +72,7 @@ table inet ftbridge_drop_fwd {
   }
 }
 EOF
-  if systemctl is-enabled nftables >/dev/null 2>&1; then
-    :
-  else
-    systemctl enable --now nftables >/dev/null 2>&1 || true
-  fi
+  systemctl enable --now nftables >/dev/null 2>&1 || true
   nft -f "$NFT_CONF" || true
 }
 
@@ -169,12 +165,12 @@ declare -A MAP_D2_TO_D1
 MAP_MTIME=0
 load_map(){
   [[ -f "$MAP_FILE" ]] || { : > "$MAP_FILE"; }
-  local mtime now
+  local mtime
   mtime=$(stat -c %Y "$MAP_FILE" 2>/dev/null || echo 0)
   [[ "$mtime" -eq "$MAP_MTIME" ]] && return 0
   MAP_D1_TO_D2=()
   MAP_D2_TO_D1=()
-  while IFS=, read -r d1 d2; do
+  while IFS=, read -r d1 d2 d1dir d2dir; do
     [[ -z "${d1// }" || -z "${d2// }" ]] && continue
     [[ "$d1" =~ ^# ]] && continue
     # On refuse les suffixes dans la MAP
