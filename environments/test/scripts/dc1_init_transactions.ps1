@@ -9,6 +9,10 @@ $shareName= 'Transactions'
 $group    = 'DMZ_2_ADM'
 $svc      = 'svc_relay_dom1'
 
+# SIDs (indépendants de la langue)
+$SID_SYSTEM = 'S-1-5-18'
+$SID_DA     = ($domain.DomainSID.Value.Trim()) + '-512' # Domain Admins
+
 Write-Host "Domaine: $($domain.DNSRoot) ($netbios)"
 
 # OUs (création à la racine du domaine)
@@ -47,20 +51,20 @@ Add-ADGroupMember -Identity $group -Members $svc -ErrorAction SilentlyContinue
 if (-not (Test-Path $shareRoot)) { New-Item -ItemType Directory -Path $shareRoot -Force | Out-Null }
 if (-not (Get-SmbShare -Name $shareName -ErrorAction SilentlyContinue)) {
   New-SmbShare -Name $shareName -Path $shareRoot `
-    -FullAccess @("Système","$netbios\Admins du domaine") `
+    -FullAccess @($SID_SYSTEM,$SID_DA) `
     -ChangeAccess @("$netbios\$svc","$netbios\$group") | Out-Null
   Set-SmbShare -Name $shareName -FolderEnumerationMode AccessBased -Confirm:$false | Out-Null
   Set-SmbShare -Name $shareName -EncryptData $true -Confirm:$false | Out-Null
   Write-Host "Partage créé: \\$env:COMPUTERNAME\$shareName"
 } else { Write-Host "Partage OK: \\$env:COMPUTERNAME\$shareName" }
 
-# ACL NTFS racine
-$aceAdmins = "$netbios\Admins du domaine:(OI)(CI)(F)"
+# ACL NTFS racine (SIDs pour éviter la localisation)
+$aceAdmins = "*$SID_DA:(OI)(CI)(F)"
 $aceSvc    = "$netbios\${svc}:(OI)(CI)(M)"
 $aceGroup  = "$netbios\${group}:(RX)"
 icacls $shareRoot /inheritance:d | Out-Null
-icacls $shareRoot /grant:r "Système:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceGroup" | Out-Null
-icacls $shareRoot /remove:g "Utilisateurs" "Utilisateurs authentifiés" 2>$null | Out-Null
+icacls $shareRoot /grant:r "*$SID_SYSTEM:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceGroup" | Out-Null
+icacls $shareRoot /remove:g "*S-1-5-32-545" "*S-1-5-11" 2>$null | Out-Null  # Builtin Users / Authenticated Users
 
 # Arborescence par membres humains du groupe
 $members = Get-ADGroupMember -Identity $group -Recursive |
@@ -77,8 +81,8 @@ foreach ($u in $members) {
 
   $aceUser = "$netbios\${name}:(OI)(CI)(M)"
   icacls $uRoot /inheritance:d | Out-Null
-  icacls $uRoot /grant:r "Système:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceUser" | Out-Null
-  icacls $uRoot /remove:g "Utilisateurs" "Utilisateurs authentifiés" 2>$null | Out-Null
+  icacls $uRoot /grant:r "*$SID_SYSTEM:(OI)(CI)(F)" "$aceAdmins" "$aceSvc" "$aceUser" | Out-Null
+  icacls $uRoot /remove:g "*S-1-5-32-545" "*S-1-5-11" 2>$null | Out-Null
   Write-Host " - $name : IN/OUT + ACL OK"
 }
 
